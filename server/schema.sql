@@ -48,3 +48,45 @@ CREATE TABLE expenses (
   expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE restaurant_settings (
+  id SERIAL PRIMARY KEY,
+  business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  total_tables INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (business_id)
+);
+
+CREATE TABLE restaurant_tables (
+  id SERIAL PRIMARY KEY,
+  business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  table_number INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'vacant' CHECK (status IN ('vacant', 'occupied', 'reserved')),
+  customer_name TEXT,
+  expected_time TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (business_id, table_number)
+);
+
+CREATE TABLE table_orders (
+  id SERIAL PRIMARY KEY,
+  business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  table_id INTEGER NOT NULL REFERENCES restaurant_tables(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'sent_to_kitchen', 'closed')),
+  total_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE table_order_items (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES table_orders(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  quantity NUMERIC(12,2) NOT NULL DEFAULT 1,
+  price NUMERIC(12,2) NOT NULL,
+  note TEXT,
+  sent_to_kitchen BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

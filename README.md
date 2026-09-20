@@ -1,16 +1,11 @@
-# React + Vite
+# Bilkaro
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+## Run locally
 
-Currently, two official plugins are available:
+1. Ensure `.env.local` contains `DATABASE_URL` and `JWT_SECRET`.
+2. Run `npm run dev`.
+3. Open the Vite address printed in the terminal (normally `http://localhost:5173`).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+`npm run dev` starts both the Vite frontend and the API server on port 4000. The API is required for saving customers, products, expenses, invoices, and payments.
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+For a production-style local run, build the frontend with `npm run build`, then use `npm start`.

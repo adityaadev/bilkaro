@@ -1,0 +1,1 @@
+ALTER TABLE restaurant_settings ADD CONSTRAINT restaurant_settings_business_id_key UNIQUE (business_id);

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Plus, Search, Trash2, Calendar, Tag, DollarSign, FileText, X } from 'lucide-react';
+import React, { useState } from 'react';
+import { Plus, Search, Trash2, Calendar, DollarSign, FileText, X } from 'lucide-react';
 import { api } from './App';
 
 const EXPENSE_CATEGORIES = [
@@ -11,7 +11,7 @@ const EXPENSE_CATEGORIES = [
   "Other"
 ];
 
-export default function ExpensesView({ expenses, onSaved, onError, onOpen }) {
+export default function ExpensesView({ expenses, onSaved, onError }) {
   const [search, setSearch] = useState("");
   const [filterDate, setFilterDate] = useState({ start: "", end: "" });
   const [showModal, setShowModal] = useState(false);
@@ -50,9 +50,9 @@ export default function ExpensesView({ expenses, onSaved, onError, onOpen }) {
         custom_category: ""
       });
       setShowModal(false);
-      onSaved();
+      await onSaved();
     } catch (error) {
-      onError(error);
+      onError("Add expense", error);
     }
   };
 
@@ -60,101 +60,126 @@ export default function ExpensesView({ expenses, onSaved, onError, onOpen }) {
     if (!window.confirm("Are you sure you want to delete this expense?")) return;
     try {
       await api.delete(`/expenses/${id}`);
-      onSaved();
+      await onSaved();
     } catch (error) {
-      onError(error);
+      onError("Delete expense", error);
     }
   };
 
+  const formatDate = (value) => {
+    return new Date(value).toLocaleDateString("en-IN", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  };
+
   return (
-    <div className="view-container">
-      <div className="view-header">
-        <div className="view-title-group">
-          <h1>Expenses</h1>
+    <div className="section-view">
+      <div className="page-heading">
+        <div>
+          <h2>Expenses</h2>
           <p>Track your business expenditures</p>
         </div>
-        <button className="primary-btn" onClick={() => setShowModal(true)}>
-          <Plus size={20} />
-          <span>Add Expense</span>
+        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+          <Plus size={16} /> Add Expense
         </button>
       </div>
 
-      <div className="view-controls">
-        <div className="search-wrapper">
-          <Search size={18} className="search-icon" />
-          <input 
-            type="text" 
-            placeholder="Search expenses..." 
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-        </div>
-        <div className="date-filter-group">
-          <div className="filter-input-wrapper">
-            <Calendar size={18} className="filter-icon" />
-            <input 
-              type="date" 
-              value={filterDate.start}
-              onChange={(e) => setFilterDate({...filterDate, start: e.target.value})}
-            />
-          </div>
-          <span className="separator">-</span>
-          <div className="filter-input-wrapper">
-            <Calendar size={18} className="filter-icon" />
-            <input 
-              type="date" 
-              value={filterDate.end}
-              onChange={(e) => setFilterDate({...filterDate, end: e.target.value})}
-            />
+      <div className="card" style={{marginBottom: 'var(--spacing-lg)'}}>
+        <div className="card-body" style={{padding: 'var(--spacing-lg) var(--spacing-xl)'}}>
+          <div className="search-row" style={{display: 'flex', gap: 'var(--spacing-md)', flexWrap: 'wrap', alignItems: 'center'}}>
+            <div className="search" style={{flex: 1, minWidth: '280px', maxWidth: '400px'}}>
+              <Search size={17} />
+              <input
+                placeholder="Search expenses..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
+            <div style={{display: 'flex', gap: 'var(--spacing-sm)', alignItems: 'center', flexWrap: 'wrap'}}>
+              <div style={{display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)'}}>
+                <Calendar size={16} />
+                <input
+                  type="date"
+                  className="form-input"
+                  style={{width: '160px'}}
+                  value={filterDate.start}
+                  onChange={(e) => setFilterDate({...filterDate, start: e.target.value})}
+                />
+              </div>
+              <span style={{color: 'var(--color-text-muted)'}}>to</span>
+              <div style={{display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)'}}>
+                <Calendar size={16} />
+                <input
+                  type="date"
+                  className="form-input"
+                  style={{width: '160px'}}
+                  value={filterDate.end}
+                  onChange={(e) => setFilterDate({...filterDate, end: e.target.value})}
+                />
+              </div>
+            </div>
           </div>
         </div>
       </div>
 
-      <div className="table-container">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Category</th>
-              <th>Note</th>
-              <th>Amount</th>
-              <th className="text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredExpenses.map((exp) => (
-              <tr key={exp.id}>
-                <td>{exp.expense_date}</td>
-                <td>
-                  <span className="badge badge-category">{exp.category}</span>
-                </td>
-                <td>{exp.note || "-"}</td>
-                <td className="font-mono font-bold">{exp.amount.toFixed(2)}</td>
-                <td className="text-right">
-                  <button className="icon-btn delete-btn" onClick={() => handleDelete(exp.id)}>
-                    <Trash2 size={18} />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="card">
+        <div className="table-head">
+          <div className="table-head-cell">DATE</div>
+          <div className="table-head-cell">CATEGORY</div>
+          <div className="table-head-cell">NOTE</div>
+          <div className="table-head-cell">AMOUNT</div>
+          <div className="table-head-cell">ACTION</div>
+        </div>
+        {filteredExpenses.map((exp) => (
+          <div className="table-row" key={exp.id}>
+            <div className="table-cell">
+              <span className="table-cell-content">{formatDate(exp.expense_date)}</span>
+            </div>
+            <div className="table-cell">
+              <span className="table-cell-content" style={{fontWeight: 500, color: 'var(--color-primary)'}}>{exp.category}</span>
+            </div>
+            <div className="table-cell">
+              <span className="table-cell-content" style={{maxWidth: '300px', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', display: 'block'}}>{exp.note || "—"}</span>
+            </div>
+            <div className="table-cell">
+              <strong className="table-cell-content" style={{fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-base)'}}>
+                ₹{Number(exp.amount || 0).toFixed(2)}
+              </strong>
+            </div>
+            <div className="table-cell table-cell-action">
+              <button className="btn btn-secondary btn-sm icon-btn" onClick={() => handleDelete(exp.id)} aria-label="Delete expense">
+                <Trash2 size={16} />
+              </button>
+            </div>
+          </div>
+        ))}
+        {!filteredExpenses.length && (
+          <div className="empty-state">
+            <FileText size={28} />
+            <strong>No expenses found</strong>
+            <span>Add your first expense to start tracking.</span>
+          </div>
+        )}
       </div>
 
       {showModal && (
-        <div className="modal-overlay">
-          <div className="modal-content">
+        <div className="modal-backdrop" onClick={() => setShowModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h2>Add New Expense</h2>
-              <button className="icon-btn" onClick={() => setShowModal(false)}>
+              <button className="modal-close" onClick={() => setShowModal(false)}>
                 <X size={24} />
               </button>
             </div>
-            <form onSubmit={handleAddExpense} className="expense-form">
+            <form onSubmit={handleAddExpense} className="expense-form" style={{display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)'}}>
               <div className="form-group">
-                <label>Category</label>
-                <div className="category-select-wrapper">
-                  <select 
+                <label className="form-label">Category</label>
+                <div style={{display: 'flex', gap: 'var(--spacing-md)', flexWrap: 'wrap', alignItems: 'flex-end'}}>
+                  <select
+                    className="form-select"
+                    style={{flex: 1, minWidth: '200px'}}
                     value={newExpense.category}
                     onChange={(e) => setNewExpense({...newExpense, category: e.target.value})}
                   >
@@ -163,54 +188,67 @@ export default function ExpensesView({ expenses, onSaved, onError, onOpen }) {
                     ))}
                   </select>
                   {newExpense.category === "Other" && (
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
+                      className="form-input"
                       placeholder="Enter custom category"
                       value={newExpense.custom_category}
                       onChange={(e) => setNewExpense({...newExpense, custom_category: e.target.value})}
                       autoFocus
+                      style={{flex: 1, minWidth: '200px'}}
                     />
                   )}
                 </div>
               </div>
-              <div className="form-group">
-                <label>Amount</label>
-                <div className="input-wrapper">
-                  <DollarSign size={18} className="input-icon" />
-                  <input 
-                    type="number" 
-                    step="0.01" 
-                    required
-                    value={newExpense.amount}
-                    onChange={(e) => setNewExpense({...newExpense, amount: e.target.value})}
-                  />
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Amount</label>
+                  <div className="input-wrapper" style={{display: 'flex', alignItems: 'center'}}>
+                    <DollarSign size={18} className="input-icon" style={{position: 'absolute', left: 'var(--spacing-md)', color: 'var(--color-text-muted)', pointerEvents: 'none'}} />
+                    <input
+                      type="number"
+                      className="form-input"
+                      style={{paddingLeft: '40px'}}
+                      step="0.01"
+                      required
+                      value={newExpense.amount}
+                      onChange={(e) => setNewExpense({...newExpense, amount: e.target.value})}
+                    />
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Date</label>
+                  <div className="input-wrapper" style={{display: 'flex', alignItems: 'center'}}>
+                    <Calendar size={18} className="input-icon" style={{position: 'absolute', left: 'var(--spacing-md)', color: 'var(--color-text-muted)', pointerEvents: 'none'}} />
+                    <input
+                      type="date"
+                      className="form-input"
+                      style={{paddingLeft: '40px'}}
+                      required
+                      value={newExpense.expense_date}
+                      onChange={(e) => setNewExpense({...newExpense, expense_date: e.target.value})}
+                    />
+                  </div>
                 </div>
               </div>
               <div className="form-group">
-                <label>Date</label>
-                <div className="input-wrapper">
-                  <Calendar size={18} className="input-icon" />
-                  <input 
-                    type="date" 
-                    required
-                    value={newExpense.expense_date}
-                    onChange={(e) => setNewExpense({...newExpense, expense_date: e.target.value})}
-                  />
-                </div>
-              </div>
-              <div className="form-group">
-                <label>Note (Optional)</label>
-                <div className="input-wrapper">
-                  <FileText size={18} className="input-icon" />
-                  <input 
-                    type="text" 
+                <label className="form-label">Note (Optional)</label>
+                <div className="input-wrapper" style={{display: 'flex', alignItems: 'center'}}>
+                  <FileText size={18} className="input-icon" style={{position: 'absolute', left: 'var(--spacing-md)', color: 'var(--color-text-muted)', pointerEvents: 'none'}} />
+                  <input
+                    type="text"
+                    className="form-input"
+                    style={{paddingLeft: '40px'}}
                     value={newExpense.note}
                     onChange={(e) => setNewExpense({...newExpense, note: e.target.value})}
                   />
                 </div>
               </div>
-              <div className="form-actions">
-                <button type="submit" className="primary-btn full-width">
+              <div className="form-actions" style={{display: 'flex', justifyContent: 'flex-end', gap: 'var(--spacing-md)', marginTop: 'var(--spacing-md)'}}>
+                <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary">
                   Save Expense
                 </button>
               </div>

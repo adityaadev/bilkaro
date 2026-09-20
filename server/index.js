@@ -140,6 +140,415 @@ app.delete('/api/expenses/:id', auth, async (req, res) => {
   if (!result.rows.length) return res.status(404).json({ error: 'Expense not found' })
   res.status(204).end()
 })
+
+app.get('/api/restaurant/settings', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const result = await pool.query('SELECT total_tables FROM restaurant_settings WHERE business_id=$1', [req.user.id])
+  res.json({ totalTables: result.rows[0]?.total_tables || 0 })
+})
+
+app.post('/api/restaurant/settings', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const { totalTables } = req.body
+  if (typeof totalTables !== 'number' || totalTables < 0 || totalTables > 100) {
+    return res.status(400).json({ error: 'Total tables must be a number between 0 and 100' })
+  }
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      'INSERT INTO restaurant_settings (business_id, total_tables, updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (business_id) DO UPDATE SET total_tables=$2, updated_at=NOW()',
+      [req.user.id, totalTables]
+    )
+    if (totalTables > 0) {
+      const existing = await client.query('SELECT table_number FROM restaurant_tables WHERE business_id=$1', [req.user.id])
+      const existingNumbers = new Set(existing.rows.map(r => r.table_number))
+      const toInsert = []
+      for (let i = 1; i <= totalTables; i++) {
+        if (!existingNumbers.has(i)) toInsert.push(i)
+      }
+      if (toInsert.length) {
+        const values = toInsert.map((_, idx) => `($1, $${idx + 2}, 'vacant', NOW(), NOW())`).join(',')
+        await client.query(
+          `INSERT INTO restaurant_tables (business_id, table_number, status, created_at, updated_at) VALUES ${values} ON CONFLICT (business_id, table_number) DO NOTHING`,
+          [req.user.id, ...toInsert]
+        )
+      }
+      if (totalTables < Math.max(...existingNumbers, 0)) {
+        await client.query('DELETE FROM restaurant_tables WHERE business_id=$1 AND table_number > $2', [req.user.id, totalTables])
+      }
+    } else {
+      await client.query('DELETE FROM restaurant_tables WHERE business_id=$1', [req.user.id])
+    }
+    await client.query('COMMIT')
+    res.json({ success: true })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+})
+
+app.get('/api/restaurant/tables', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const result = await pool.query(
+    'SELECT id, table_number, status, customer_name, expected_time FROM restaurant_tables WHERE business_id=$1 ORDER BY table_number',
+    [req.user.id]
+  )
+  res.json(result.rows)
+})
+
+app.patch('/api/restaurant/tables/:id', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const { status, customerName, expectedTime } = req.body
+  if (!['vacant', 'occupied', 'reserved'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' })
+  }
+  const result = await pool.query(
+    'UPDATE restaurant_tables SET status=$1, customer_name=$2, expected_time=$3, updated_at=NOW() WHERE id=$4 AND business_id=$5 RETURNING *',
+    [status, customerName || null, expectedTime || null, req.params.id, req.user.id]
+  )
+  if (!result.rows.length) return res.status(404).json({ error: 'Table not found' })
+  res.json(result.rows[0])
+})
+
+// Get or create open order for a table
+app.get('/api/restaurant/tables/:tableId/order', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const tableId = req.params.tableId
+  
+  // Verify table belongs to business
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
+  
+  // Get or create open order
+  let orderResult = await pool.query(
+    'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
+    [tableId, req.user.id]
+  )
+  
+  if (!orderResult.rows.length) {
+    orderResult = await pool.query(
+      'INSERT INTO table_orders (business_id, table_id, status, total_amount) VALUES ($1,$2,\'open\',0) RETURNING *',
+      [req.user.id, tableId]
+    )
+  }
+  
+  const order = orderResult.rows[0]
+  
+  // Get order items
+  const itemsResult = await pool.query(
+    `SELECT oi.*, p.name, p.category, p.unit 
+     FROM table_order_items oi 
+     JOIN products p ON p.id = oi.product_id 
+     WHERE oi.order_id=$1 
+     ORDER BY oi.created_at`,
+    [order.id]
+  )
+  
+  res.json({ order, items: itemsResult.rows })
+})
+
+// Add items to table order
+app.post('/api/restaurant/tables/:tableId/order/items', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const tableId = req.params.tableId
+  const { items } = req.body // [{ productId, quantity, note }]
+  
+  if (!items || !items.length) return res.status(400).json({ error: 'Items required' })
+  
+  // Verify table belongs to business
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
+  
+  // Get or create open order
+  let orderResult = await pool.query(
+    'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
+    [tableId, req.user.id]
+  )
+  
+  if (!orderResult.rows.length) {
+    orderResult = await pool.query(
+      'INSERT INTO table_orders (business_id, table_id, status, total_amount) VALUES ($1,$2,\'open\',0) RETURNING *',
+      [req.user.id, tableId]
+    )
+  }
+  
+  const order = orderResult.rows[0]
+  const client = await pool.connect()
+  
+  try {
+    await client.query('BEGIN')
+    
+    let orderTotal = Number(order.total_amount)
+    const addedItems = []
+    
+    for (const item of items) {
+      const { productId, quantity = 1, note } = item
+      
+      // Verify product belongs to business and get price
+      const productResult = await client.query(
+        'SELECT id, selling_price FROM products WHERE id=$1 AND business_id=$2',
+        [productId, req.user.id]
+      )
+      if (!productResult.rows.length) throw Object.assign(new Error('Product not found'), { status: 404 })
+      
+      const price = Number(productResult.rows[0].selling_price)
+      const qty = Number(quantity)
+      const itemTotal = price * qty
+      orderTotal += itemTotal
+      
+      const itemResult = await client.query(
+        'INSERT INTO table_order_items (order_id, product_id, quantity, price, note) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [order.id, productId, qty, price, note || null]
+      )
+      addedItems.push(itemResult.rows[0])
+    }
+    
+    // Update order total
+    await client.query(
+      'UPDATE table_orders SET total_amount=$1, updated_at=NOW() WHERE id=$2',
+      [orderTotal, order.id]
+    )
+    
+    await client.query('COMMIT')
+    
+    // Return updated order with items
+    const itemsResult = await pool.query(
+      `SELECT oi.*, p.name, p.category, p.unit 
+       FROM table_order_items oi 
+       JOIN products p ON p.id = oi.product_id 
+       WHERE oi.order_id=$1 
+       ORDER BY oi.created_at`,
+      [order.id]
+    )
+    
+    res.json({ order: { ...order, total_amount: orderTotal }, items: itemsResult.rows })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+})
+
+// Generate KOT (Kitchen Order Ticket)
+app.get('/api/restaurant/tables/:tableId/kot', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const tableId = req.params.tableId
+  
+  // Verify table belongs to business
+  const tableResult = await pool.query(
+    'SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2',
+    [tableId, req.user.id]
+  )
+  if (!tableResult.rows.length) return res.status(404).json({ error: 'Table not found' })
+  
+  const table = tableResult.rows[0]
+  
+  // Get the latest order for this table
+  const orderResult = await pool.query(
+    'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
+    [tableId, req.user.id]
+  )
+  
+  if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
+  
+  const order = orderResult.rows[0]
+  
+  // Get order items
+  const itemsResult = await pool.query(
+    `SELECT oi.*, p.name, p.category, p.unit 
+     FROM table_order_items oi 
+     JOIN products p ON p.id = oi.product_id 
+     WHERE oi.order_id=$1 
+     ORDER BY p.category, oi.created_at`,
+    [order.id]
+  )
+  
+  // Get business name
+  const businessResult = await pool.query('SELECT name FROM businesses WHERE id=$1', [req.user.id])
+  
+  res.json({
+    tableNumber: table.table_number,
+    businessName: businessResult.rows[0]?.name || 'Restaurant',
+    orderId: order.id,
+    orderStatus: order.status,
+    items: itemsResult.rows,
+    timestamp: new Date().toISOString(),
+    totalAmount: order.total_amount
+  })
+})
+
+// Mark order as sent to kitchen
+app.post('/api/restaurant/tables/:tableId/order/send-to-kitchen', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const tableId = req.params.tableId
+  
+  // Verify table belongs to business
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
+  
+  // Get the latest order
+  const orderResult = await pool.query(
+    'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
+    [tableId, req.user.id]
+  )
+  
+  if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
+  
+  const order = orderResult.rows[0]
+  
+  // Update order status and mark items as sent
+  await pool.query(
+    'UPDATE table_orders SET status=\'sent_to_kitchen\', updated_at=NOW() WHERE id=$1',
+    [order.id]
+  )
+  await pool.query(
+    'UPDATE table_order_items SET sent_to_kitchen=TRUE WHERE order_id=$1',
+    [order.id]
+  )
+  
+  res.json({ success: true, orderId: order.id })
+})
+
+// Generate bill from table order - creates invoice
+app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const tableId = req.params.tableId
+  const { customerId, paid = 0 } = req.body
+  
+  // Verify table belongs to business
+  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
+  const table = tableCheck.rows[0]
+  
+  // Get the latest order
+  const orderResult = await pool.query(
+    'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
+    [tableId, req.user.id]
+  )
+  
+  if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
+  
+  const order = orderResult.rows[0]
+  
+  // Get order items
+  const itemsResult = await pool.query(
+    `SELECT oi.*, p.name 
+     FROM table_order_items oi 
+     JOIN products p ON p.id = oi.product_id 
+     WHERE oi.order_id=$1 
+     ORDER BY oi.created_at`,
+    [order.id]
+  )
+  
+  if (!itemsResult.rows.length) return res.status(400).json({ error: 'No items in order' })
+  
+  const client = await pool.connect()
+  
+  try {
+    await client.query('BEGIN')
+    
+    const total = Number(order.total_amount)
+    const paymentAmount = Number(paid) || 0
+    const due = Math.max(total - paymentAmount, 0)
+    const status = paymentAmount >= total ? 'paid' : paymentAmount > 0 ? 'partial' : 'udhar'
+    
+    // Create invoice
+    const invoiceResult = await client.query(
+      'INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [req.user.id, customerId || null, total, paymentAmount, status]
+    )
+    const invoice = invoiceResult.rows[0]
+    
+    // Add invoice items
+    for (const item of itemsResult.rows) {
+      await client.query(
+        'INSERT INTO invoice_items (invoice_id, product_id, quantity, price) VALUES ($1,$2,$3,$4)',
+        [invoice.id, item.product_id, item.quantity, item.price]
+      )
+    }
+    
+    // Update customer balance if there's due amount
+    if (customerId && due > 0) {
+      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.id])
+      await client.query("INSERT INTO udhar_ledger (customer_id, invoice_id, type, amount, note) VALUES ($1,$2,'credit',$3,'Invoice credit')", [customerId, invoice.id, due])
+    }
+    
+    // Mark table order as closed
+    await client.query(
+      'UPDATE table_orders SET status=\'closed\', updated_at=NOW() WHERE id=$1',
+      [order.id]
+    )
+    
+    // Free up the table
+    await client.query(
+      'UPDATE restaurant_tables SET status=\'vacant\', customer_name=NULL, expected_time=NULL, updated_at=NOW() WHERE id=$1',
+      [tableId]
+    )
+    
+    await client.query('COMMIT')
+    
+    res.status(201).json({ 
+      invoice, 
+      tableNumber: table.table_number,
+      message: 'Bill generated successfully'
+    })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+})
+
+// Get bill preview for table order (without creating invoice)
+app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const tableId = req.params.tableId
+  
+  // Verify table belongs to business
+  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
+  const table = tableCheck.rows[0]
+  
+  // Get the latest order
+  const orderResult = await pool.query(
+    'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
+    [tableId, req.user.id]
+  )
+  
+  if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
+  
+  const order = orderResult.rows[0]
+  
+  // Get order items
+  const itemsResult = await pool.query(
+    `SELECT oi.*, p.name, p.category 
+     FROM table_order_items oi 
+     JOIN products p ON p.id = oi.product_id 
+     WHERE oi.order_id=$1 
+     ORDER BY p.category, oi.created_at`,
+    [order.id]
+  )
+  
+  // Get business name
+  const businessResult = await pool.query('SELECT name, address FROM businesses WHERE id=$1', [req.user.id])
+  
+  res.json({
+    tableNumber: table.table_number,
+    businessName: businessResult.rows[0]?.name || 'Restaurant',
+    businessAddress: businessResult.rows[0]?.address || '',
+    orderId: order.id,
+    orderStatus: order.status,
+    items: itemsResult.rows,
+    subtotal: order.total_amount,
+    timestamp: new Date().toISOString()
+  })
+})
+
 app.post('/api/payments', auth, async (req, res) => {
   const { customerId, amount, note = 'Payment received' } = req.body
   if (!customerId || !amount || Number(amount) <= 0) return res.status(400).json({ error: 'Customer and positive payment amount are required' })
@@ -152,5 +561,5 @@ app.use((error, _req, res, _next) => { console.error('[API ERROR]', error); res.
 app.use(express.static('dist'))
 app.listen(port, () => {
   console.log(`Bilkaro API running on http://localhost:${port}`)
-  console.log('DATABASE_URL:', process.env.DATABASE_URL)
+  console.log(`Database configured: ${Boolean(pool)}`)
 })
