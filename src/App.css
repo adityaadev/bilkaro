@@ -1294,7 +1294,6 @@ input, select, textarea {
 .modal-body {
   padding: var(--spacing-xl);
   overflow-y: auto;
-  flex: 1;
   min-height: 0;
 }
 

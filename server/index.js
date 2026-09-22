@@ -155,27 +155,27 @@ app.get('/api/analytics', auth, async (req, res) => {
   let paramIndex = 2
 
   if (startDate && endDate) {
-    dateFilter = `AND created_at::date BETWEEN $${paramIndex} AND $${paramIndex + 1}`
+    dateFilter = `AND i.created_at::date BETWEEN $${paramIndex} AND $${paramIndex + 1}`
     dateParams.push(startDate, endDate)
     paramIndex += 2
   } else {
     switch (period) {
       case 'day':
-        dateFilter = "AND created_at::date = CURRENT_DATE"
+        dateFilter = "AND i.created_at::date = CURRENT_DATE"
         break
       case 'week':
-        dateFilter = "AND created_at::date >= CURRENT_DATE - INTERVAL '6 days'"
+        dateFilter = "AND i.created_at::date >= CURRENT_DATE - INTERVAL '6 days'"
         break
       case 'month':
-        dateFilter = "AND created_at::date >= DATE_TRUNC('month', CURRENT_DATE)"
+        dateFilter = "AND i.created_at::date >= DATE_TRUNC('month', CURRENT_DATE)"
         break
       case 'year':
-        dateFilter = "AND created_at::date >= DATE_TRUNC('year', CURRENT_DATE)"
+        dateFilter = "AND i.created_at::date >= DATE_TRUNC('year', CURRENT_DATE)"
         break
     }
   }
 
-  const expenseDateFilter = dateFilter.replace('created_at', 'expense_date')
+  const expenseDateFilter = dateFilter.replace('i.created_at', 'expense_date')
 
   try {
     const [
@@ -187,8 +187,8 @@ app.get('/api/analytics', auth, async (req, res) => {
       outstandingBalances,
       profitEstimate
     ] = await Promise.all([
-      pool.query(`SELECT COALESCE(SUM(total),0) as total_sales, COALESCE(SUM(paid),0) as total_paid, COUNT(*) as invoice_count FROM invoices WHERE business_id=$1 ${dateFilter}`, dateParams),
-      pool.query(`SELECT created_at::date as date, COALESCE(SUM(total),0) as daily_sales, COUNT(*) as invoice_count FROM invoices WHERE business_id=$1 ${dateFilter} GROUP BY created_at::date ORDER BY date`, dateParams),
+      pool.query(`SELECT COALESCE(SUM(i.total),0) as total_sales, COALESCE(SUM(i.paid),0) as total_paid, COUNT(*) as invoice_count FROM invoices i WHERE i.business_id=$1 ${dateFilter}`, dateParams),
+      pool.query(`SELECT i.created_at::date as date, COALESCE(SUM(i.total),0) as daily_sales, COUNT(*) as invoice_count FROM invoices i WHERE i.business_id=$1 ${dateFilter} GROUP BY i.created_at::date ORDER BY date`, dateParams),
       pool.query(`SELECT COALESCE(SUM(amount),0) as total_expenses FROM expenses WHERE business_id=$1 ${expenseDateFilter}`, dateParams),
       pool.query(`SELECT category, COALESCE(SUM(amount),0) as total FROM expenses WHERE business_id=$1 ${expenseDateFilter} GROUP BY category ORDER BY total DESC`, dateParams),
       pool.query(`
