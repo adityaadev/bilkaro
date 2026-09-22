@@ -30,7 +30,8 @@ CREATE TABLE invoices (
 );
 CREATE TABLE invoice_items (
   id SERIAL PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL, quantity NUMERIC(12,2) NOT NULL, price NUMERIC(12,2) NOT NULL
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL, quantity NUMERIC(12,2) NOT NULL, price NUMERIC(12,2) NOT NULL,
+  gst_percent NUMERIC(5,2) NOT NULL DEFAULT 0, discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0, discount_amount NUMERIC(12,2) NOT NULL DEFAULT 0
 );
 CREATE TABLE udhar_ledger (
   id SERIAL PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,

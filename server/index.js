@@ -27,8 +27,8 @@ const allowedOrigins = new Set(['http://localhost:5173', 'http://localhost:5174'
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
 app.use(express.json())
 
-const toBusiness = (business) => business && ({ id: business.id, name: business.name, ownerName: business.owner_name, email: business.email, phone: business.phone, category: business.category, businessDescription: business.business_description, isExisting: business.is_existing, yearsRunning: business.years_running, address: business.address })
-const tokenFor = (user) => jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET || 'bilkaro-local-secret', { expiresIn: '7d' })
+const toBusiness = (business) => business && ({ id: business.id, name: business.name, ownerName: business.owner_name, email: business.email, phone: business.phone, category: business.category, businessType: business.category, businessDescription: business.business_description, isExisting: business.is_existing, yearsRunning: business.years_running, address: business.address })
+const tokenFor = (user) => jwt.sign({ id: user.id, email: user.email, category: user.category }, process.env.JWT_SECRET || 'bilkaro-local-secret', { expiresIn: '7d' })
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '')
   try { req.user = jwt.verify(token, process.env.JWT_SECRET || 'bilkaro-local-secret'); next() } catch { res.status(401).json({ error: 'Authentication required' }) }
@@ -92,7 +92,7 @@ app.delete('/api/customers/:id', auth, async (req, res) => {
   res.status(204).end()
 })
 app.post('/api/invoices', auth, async (req, res) => {
-  const { customerId, items = [], total, paid = 0, status = 'paid' } = req.body
+  const { customerId, items = [], total, paid = 0, status } = req.body
   if (!items.length || !total) return res.status(400).json({ error: 'Invoice items and total are required' })
   const client = await pool.connect()
   try {
@@ -104,9 +104,13 @@ app.post('/api/invoices', auth, async (req, res) => {
       if (!product.rows.length) throw Object.assign(new Error('Product does not belong to this business'), { status: 403 })
       if (Number(product.rows[0].current_stock) < Number(item.quantity)) throw Object.assign(new Error(`Insufficient stock for product ${item.productId}`), { status: 400 })
     }
-    const invoice = await client.query('INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.id, customerId || null, total, paid, status])
+    const udharEnabledTypes = ['retail', 'wholesaler', 'school', 'other']
+    const businessCategory = req.user.category || 'other'
+    const hasUdhar = udharEnabledTypes.includes(businessCategory)
+    const defaultStatus = !status ? (Number(paid) >= total ? 'paid' : Number(paid) > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid')) : status
+    const invoice = await client.query('INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.id, customerId || null, total, paid, defaultStatus])
     for (const item of items) {
-      await client.query('INSERT INTO invoice_items (invoice_id, product_id, quantity, price) VALUES ($1,$2,$3,$4)', [invoice.rows[0].id, item.productId, item.quantity, item.price])
+      await client.query('INSERT INTO invoice_items (invoice_id, product_id, quantity, price, gst_percent, discount_percent, discount_amount) VALUES ($1,$2,$3,$4,$5,$6,$7)', [invoice.rows[0].id, item.productId, item.quantity, item.price, item.gstPercent || 0, item.discountPercent || 0, item.discountAmount || 0])
       await client.query('UPDATE products SET current_stock=current_stock-$1 WHERE id=$2 AND business_id=$3', [item.quantity, item.productId, req.user.id])
     }
     const due = Math.max(Number(total) - Number(paid), 0)
@@ -139,6 +143,121 @@ app.delete('/api/expenses/:id', auth, async (req, res) => {
   const result = await pool.query('DELETE FROM expenses WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.id])
   if (!result.rows.length) return res.status(404).json({ error: 'Expense not found' })
   res.status(204).end()
+})
+
+app.get('/api/analytics', auth, async (req, res) => {
+  if (!pool) return res.json({ sales: {}, expenses: {}, profit: {}, topProducts: [], outstanding: {} })
+  const businessId = req.user.id
+  const { period = 'month', startDate, endDate } = req.query
+
+  let dateFilter = ''
+  let dateParams = [businessId]
+  let paramIndex = 2
+
+  if (startDate && endDate) {
+    dateFilter = `AND created_at::date BETWEEN $${paramIndex} AND $${paramIndex + 1}`
+    dateParams.push(startDate, endDate)
+    paramIndex += 2
+  } else {
+    switch (period) {
+      case 'day':
+        dateFilter = "AND created_at::date = CURRENT_DATE"
+        break
+      case 'week':
+        dateFilter = "AND created_at::date >= CURRENT_DATE - INTERVAL '6 days'"
+        break
+      case 'month':
+        dateFilter = "AND created_at::date >= DATE_TRUNC('month', CURRENT_DATE)"
+        break
+      case 'year':
+        dateFilter = "AND created_at::date >= DATE_TRUNC('year', CURRENT_DATE)"
+        break
+    }
+  }
+
+  const expenseDateFilter = dateFilter.replace('created_at', 'expense_date')
+
+  try {
+    const [
+      salesSummary,
+      salesByDay,
+      expensesSummary,
+      expensesByCategory,
+      topProducts,
+      outstandingBalances,
+      profitEstimate
+    ] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(total),0) as total_sales, COALESCE(SUM(paid),0) as total_paid, COUNT(*) as invoice_count FROM invoices WHERE business_id=$1 ${dateFilter}`, dateParams),
+      pool.query(`SELECT created_at::date as date, COALESCE(SUM(total),0) as daily_sales, COUNT(*) as invoice_count FROM invoices WHERE business_id=$1 ${dateFilter} GROUP BY created_at::date ORDER BY date`, dateParams),
+      pool.query(`SELECT COALESCE(SUM(amount),0) as total_expenses FROM expenses WHERE business_id=$1 ${expenseDateFilter}`, dateParams),
+      pool.query(`SELECT category, COALESCE(SUM(amount),0) as total FROM expenses WHERE business_id=$1 ${expenseDateFilter} GROUP BY category ORDER BY total DESC`, dateParams),
+      pool.query(`
+        SELECT p.name, p.category, COALESCE(SUM(ii.quantity),0) as total_qty, COALESCE(SUM(ii.quantity * ii.price),0) as total_revenue
+        FROM invoice_items ii
+        JOIN invoices i ON i.id = ii.invoice_id
+        JOIN products p ON p.id = ii.product_id
+        WHERE i.business_id=$1 ${dateFilter}
+        GROUP BY p.id, p.name, p.category
+        ORDER BY total_revenue DESC
+        LIMIT 10
+      `, dateParams),
+      pool.query(`SELECT c.name, c.phone, c.balance FROM customers WHERE business_id=$1 AND balance > 0 ORDER BY c.balance DESC LIMIT 20`, [businessId]),
+      pool.query(`
+        SELECT 
+          COALESCE(SUM(i.total),0) as revenue,
+          COALESCE(SUM(ii.quantity * p.purchase_price),0) as cogs,
+          COALESCE(SUM(e.amount),0) as expenses
+        FROM invoices i
+        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
+        LEFT JOIN products p ON p.id = ii.product_id
+        LEFT JOIN expenses e ON e.business_id = i.business_id AND e.expense_date::date = i.created_at::date
+        WHERE i.business_id=$1 ${dateFilter}
+      `, dateParams)
+    ])
+
+    const sales = salesSummary.rows[0]
+    const expenses = expensesSummary.rows[0]
+    const profit = profitEstimate.rows[0]
+
+    const grossProfit = Number(profit.revenue) - Number(profit.cogs)
+    const operatingProfit = grossProfit - Number(profit.expenses)
+
+    res.json({
+      sales: {
+        total: Number(sales.total_sales || 0),
+        paid: Number(sales.total_paid || 0),
+        invoiceCount: Number(sales.invoice_count || 0),
+        byDay: salesByDay.rows.map(r => ({ date: r.date, sales: Number(r.daily_sales), count: Number(r.invoice_count) }))
+      },
+      expenses: {
+        total: Number(expenses.total_expenses || 0),
+        byCategory: expensesByCategory.rows.map(r => ({ category: r.category, total: Number(r.total) }))
+      },
+      profit: {
+        revenue: Number(profit.revenue || 0),
+        cogs: Number(profit.cogs || 0),
+        expenses: Number(profit.expenses || 0),
+        grossProfit: Math.round(grossProfit * 100) / 100,
+        operatingProfit: Math.round(operatingProfit * 100) / 100,
+        grossMargin: profit.revenue > 0 ? Math.round((grossProfit / Number(profit.revenue)) * 10000) / 100 : 0,
+        operatingMargin: profit.revenue > 0 ? Math.round((operatingProfit / Number(profit.revenue)) * 10000) / 100 : 0,
+        note: 'Gross Profit = Revenue - COGS (product purchase prices). Operating Profit = Gross Profit - Expenses. Both are estimates based on recorded purchase prices and expenses.'
+      },
+      topProducts: topProducts.rows.map(r => ({
+        name: r.name,
+        category: r.category,
+        quantity: Number(r.total_qty),
+        revenue: Number(r.total_revenue)
+      })),
+      outstanding: {
+        total: outstandingBalances.rows.reduce((sum, r) => sum + Number(r.balance), 0),
+        customers: outstandingBalances.rows.map(r => ({ name: r.name, phone: r.phone, balance: Number(r.balance) }))
+      }
+    })
+  } catch (error) {
+    console.error('[Analytics]', error)
+    res.status(500).json({ error: 'Failed to fetch analytics' })
+  }
 })
 
 app.get('/api/restaurant/settings', auth, async (req, res) => {
@@ -454,7 +573,10 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req
     const total = Number(order.total_amount)
     const paymentAmount = Number(paid) || 0
     const due = Math.max(total - paymentAmount, 0)
-    const status = paymentAmount >= total ? 'paid' : paymentAmount > 0 ? 'partial' : 'udhar'
+    const udharEnabledTypes = ['retail', 'wholesaler', 'school', 'other']
+    const businessCategory = req.user.category || 'other'
+    const hasUdhar = udharEnabledTypes.includes(businessCategory)
+    const status = paymentAmount >= total ? 'paid' : paymentAmount > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid')
     
     // Create invoice
     const invoiceResult = await client.query(
@@ -463,11 +585,12 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req
     )
     const invoice = invoiceResult.rows[0]
     
-    // Add invoice items
+    // Add invoice items with GST (default 5% for restaurant food)
     for (const item of itemsResult.rows) {
+      const gstPercent = 5 // Default GST for restaurant food items
       await client.query(
-        'INSERT INTO invoice_items (invoice_id, product_id, quantity, price) VALUES ($1,$2,$3,$4)',
-        [invoice.id, item.product_id, item.quantity, item.price]
+        'INSERT INTO invoice_items (invoice_id, product_id, quantity, price, gst_percent, discount_percent, discount_amount) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [invoice.id, item.product_id, item.quantity, item.price, gstPercent, 0, 0]
       )
     }
     
@@ -524,7 +647,7 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, async (req, 
   
   const order = orderResult.rows[0]
   
-  // Get order items
+// Get order items
   const itemsResult = await pool.query(
     `SELECT oi.*, p.name, p.category 
      FROM table_order_items oi 
@@ -533,18 +656,39 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, async (req, 
      ORDER BY p.category, oi.created_at`,
     [order.id]
   )
-  
+
+  // Calculate GST for bill preview (default 5% for restaurant)
+  const itemsWithGst = itemsResult.rows.map(item => {
+    const qty = Number(item.quantity)
+    const price = Number(item.price)
+    const itemTotal = qty * price
+    const gstPercent = 5 // Default GST for restaurant food
+    const gstAmount = (itemTotal * gstPercent) / 100
+    return {
+      ...item,
+      gstPercent,
+      gstAmount,
+      itemTotal,
+      totalWithGst: itemTotal + gstAmount
+    }
+  })
+  const subtotal = itemsWithGst.reduce((sum, item) => sum + item.itemTotal, 0)
+  const totalGst = itemsWithGst.reduce((sum, item) => sum + item.gstAmount, 0)
+  const grandTotal = subtotal + totalGst
+
   // Get business name
   const businessResult = await pool.query('SELECT name, address FROM businesses WHERE id=$1', [req.user.id])
-  
+
   res.json({
     tableNumber: table.table_number,
     businessName: businessResult.rows[0]?.name || 'Restaurant',
     businessAddress: businessResult.rows[0]?.address || '',
     orderId: order.id,
     orderStatus: order.status,
-    items: itemsResult.rows,
-    subtotal: order.total_amount,
+    items: itemsWithGst,
+    subtotal,
+    totalGst,
+    grandTotal,
     timestamp: new Date().toISOString()
   })
 })
@@ -557,6 +701,190 @@ app.post('/api/payments', auth, async (req, res) => {
   await pool.query("INSERT INTO udhar_ledger (customer_id, type, amount, note) VALUES ($1,'payment',$2,$3)", [customerId, amount, note])
   res.status(201).json(result.rows[0])
 })
+
+app.post('/api/invoices/:id/pdf', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const invoiceId = req.params.id
+  
+  // Get invoice with items and business info
+  const invoiceResult = await pool.query(
+    `SELECT i.*, b.name as business_name, b.address as business_address, b.email as business_email, b.phone as business_phone,
+            c.name as customer_name, c.phone as customer_phone, c.email as customer_email, c.address as customer_address
+     FROM invoices i
+     JOIN businesses b ON b.id = i.business_id
+     LEFT JOIN customers c ON c.id = i.customer_id
+     WHERE i.id = $1 AND i.business_id = $2`,
+    [invoiceId, req.user.id]
+  )
+  
+  if (!invoiceResult.rows.length) return res.status(404).json({ error: 'Invoice not found' })
+  
+  const invoice = invoiceResult.rows[0]
+  
+// Get invoice items with product details
+  const itemsResult = await pool.query(
+    `SELECT ii.*, p.name, p.category, p.unit
+     FROM invoice_items ii
+     JOIN products p ON p.id = ii.product_id
+     WHERE ii.invoice_id = $1
+     ORDER BY ii.id`,
+    [invoiceId]
+  )
+
+  const items = itemsResult.rows
+
+  // Generate PDF using PDFKit
+  const PDFDocument = (await import('pdfkit')).default
+  const doc = new PDFDocument({ margin: 50, size: 'A4' })
+
+  res.setHeader('Content-Type', 'application/pdf')
+  res.setHeader('Content-Disposition', `attachment; filename="invoice-${invoiceId}.pdf"`)
+
+  doc.pipe(res)
+
+  // Business header
+  doc.fontSize(24).font('Helvetica-Bold').text(invoice.business_name, { align: 'left' })
+  doc.fontSize(10).font('Helvetica').text(invoice.business_address || '', { align: 'left' })
+  doc.text(`Phone: ${invoice.business_phone || ''}`, { align: 'left' })
+  doc.text(`Email: ${invoice.business_email || ''}`, { align: 'left' })
+  doc.moveDown()
+
+  // Invoice title
+  doc.fontSize(18).font('Helvetica-Bold').text('INVOICE', { align: 'right' })
+  doc.moveDown()
+
+  // Invoice details
+  doc.fontSize(10).font('Helvetica')
+  const invoiceDate = new Date(invoice.created_at).toLocaleDateString('en-IN')
+  doc.text(`Invoice #: ${invoice.id}`, { align: 'left', continued: true })
+  doc.text(`Date: ${invoiceDate}`, { align: 'right' })
+  doc.text(`Status: ${invoice.status.toUpperCase()}`, { align: 'left', continued: true })
+  doc.moveDown()
+
+  // Customer details
+  if (invoice.customer_name) {
+    doc.fontSize(12).font('Helvetica-Bold').text('Bill To:', { align: 'left' })
+    doc.fontSize(10).font('Helvetica')
+    doc.text(invoice.customer_name, { align: 'left' })
+    if (invoice.customer_phone) doc.text(`Phone: ${invoice.customer_phone}`, { align: 'left' })
+    if (invoice.customer_email) doc.text(`Email: ${invoice.customer_email}`, { align: 'left' })
+    if (invoice.customer_address) doc.text(invoice.customer_address, { align: 'left' })
+    doc.moveDown()
+  }
+
+  // Items table header
+  const colWidths = { sr: 35, name: 160, qty: 45, unit: 45, price: 60, disc: 45, gst: 45, amount: 85 }
+  const tableLeft = 50
+  let y = doc.y
+
+  doc.fontSize(8).font('Helvetica-Bold')
+  doc.rect(tableLeft, y, 520, 20).fill('#f3f4f6')
+  doc.fillColor('#1f2937')
+  doc.text('Sr', tableLeft + 5, y + 5, { width: colWidths.sr })
+  doc.text('Description', tableLeft + colWidths.sr + 5, y + 5, { width: colWidths.name })
+  doc.text('Qty', tableLeft + colWidths.sr + colWidths.name + 5, y + 5, { width: colWidths.qty, align: 'center' })
+  doc.text('Unit', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + 5, y + 5, { width: colWidths.unit, align: 'center' })
+  doc.text('Price', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + 5, y + 5, { width: colWidths.price, align: 'right' })
+  doc.text('Disc %', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + 5, y + 5, { width: colWidths.disc, align: 'center' })
+  doc.text('GST %', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + colWidths.disc + 5, y + 5, { width: colWidths.gst, align: 'center' })
+  doc.text('Amount', tableLeft + 520 - colWidths.amount, y + 5, { width: colWidths.amount, align: 'right' })
+  doc.fillColor('#000000')
+  y += 20
+
+  // Items rows
+  let subtotal = 0
+  let totalDiscount = 0
+  let totalGst = 0
+  doc.fontSize(8).font('Helvetica')
+
+  items.forEach((item, index) => {
+    const qty = Number(item.quantity)
+    const price = Number(item.price)
+    const gstPercent = Number(item.gst_percent || 0)
+    const discountPercent = Number(item.discount_percent || 0)
+    const itemTotal = qty * price
+    const discountAmount = (itemTotal * discountPercent) / 100
+    const taxableAmount = itemTotal - discountAmount
+    const gstAmount = (taxableAmount * gstPercent) / 100
+    const rowTotal = taxableAmount + gstAmount
+
+    subtotal += itemTotal
+    totalDiscount += discountAmount
+    totalGst += gstAmount
+
+    if (y > 700) {
+      doc.addPage()
+      y = 50
+    }
+
+    const rowHeight = 20
+    if (index % 2 === 0) {
+      doc.rect(tableLeft, y, 520, rowHeight).fill('#fafafa')
+    }
+    doc.fillColor('#1f2937')
+    doc.text(String(index + 1), tableLeft + 5, y + 5, { width: colWidths.sr })
+    doc.text(item.name, tableLeft + colWidths.sr + 5, y + 5, { width: colWidths.name })
+    doc.text(String(qty), tableLeft + colWidths.sr + colWidths.name + 5, y + 5, { width: colWidths.qty, align: 'center' })
+    doc.text(item.unit || 'pcs', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + 5, y + 5, { width: colWidths.unit, align: 'center' })
+    doc.text(`₹${price.toFixed(2)}`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + 5, y + 5, { width: colWidths.price, align: 'right' })
+    doc.text(`${discountPercent}%`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + 5, y + 5, { width: colWidths.disc, align: 'center' })
+    doc.text(`${gstPercent}%`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + colWidths.disc + 5, y + 5, { width: colWidths.gst, align: 'center' })
+    doc.text(`₹${rowTotal.toFixed(2)}`, tableLeft + 520 - colWidths.amount, y + 5, { width: colWidths.amount, align: 'right' })
+    y += rowHeight
+  })
+
+  // Totals
+  doc.moveDown(2)
+  const grandTotal = subtotal - totalDiscount + totalGst
+  const cgst = totalGst / 2
+  const sgst = totalGst / 2
+
+  doc.fontSize(10).font('Helvetica')
+  doc.text(`Subtotal:`, { align: 'right', continued: true })
+  doc.text(`₹${subtotal.toFixed(2)}`, { align: 'right' })
+  if (totalDiscount > 0) {
+    doc.text(`Discount:`, { align: 'right', continued: true })
+    doc.text(`-₹${totalDiscount.toFixed(2)}`, { align: 'right' })
+  }
+  if (totalGst > 0) {
+    doc.text(`CGST (${(totalGst / (subtotal - totalDiscount) * 50).toFixed(1)}%):`, { align: 'right', continued: true })
+    doc.text(`₹${cgst.toFixed(2)}`, { align: 'right' })
+    doc.text(`SGST (${(totalGst / (subtotal - totalDiscount) * 50).toFixed(1)}%):`, { align: 'right', continued: true })
+    doc.text(`₹${sgst.toFixed(2)}`, { align: 'right' })
+    doc.text(`Total GST:`, { align: 'right', continued: true })
+    doc.text(`₹${totalGst.toFixed(2)}`, { align: 'right' })
+  }
+  doc.fontSize(12).font('Helvetica-Bold')
+  doc.text(`Grand Total:`, { align: 'right', continued: true })
+  doc.text(`₹${grandTotal.toFixed(2)}`, { align: 'right' })
+  
+  // Payment info
+  doc.moveDown(2)
+  doc.fontSize(10).font('Helvetica')
+  doc.text(`Paid: ₹${Number(invoice.paid || 0).toFixed(2)}`, { align: 'left' })
+  doc.text(`Balance: ₹${Math.max(Number(invoice.total) - Number(invoice.paid || 0), 0).toFixed(2)}`, { align: 'left' })
+  
+  // Footer
+  doc.moveDown(3)
+  doc.fontSize(9).font('Helvetica-Oblique').text('Thank you for your business!', { align: 'center' })
+  doc.text('Generated by Bilkaro', { align: 'center' })
+  
+  doc.end()
+})
+
+app.post('/api/business/update-type', auth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const { category } = req.body
+  const validCategories = ['retail', 'wholesaler', 'restaurant', 'school', 'services', 'other']
+  if (!validCategories.includes(category)) {
+    return res.status(400).json({ error: 'Invalid business type' })
+  }
+  const result = await pool.query('UPDATE businesses SET category=$1 WHERE id=$2 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address', [category, req.user.id])
+  if (!result.rows.length) return res.status(404).json({ error: 'Business not found' })
+  const user = result.rows[0]
+  res.json({ user: toBusiness(user) })
+})
+
 app.use((error, _req, res, _next) => { console.error('[API ERROR]', error); res.status(error.status || 500).json({ error: error.message || 'Internal server error' }) })
 app.use(express.static('dist'))
 app.listen(port, () => {

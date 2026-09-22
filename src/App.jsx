@@ -16,6 +16,7 @@ import {
   Settings,
   ShoppingCart,
   Table,
+  TrendingUp,
   Users,
   Wallet,
   X,
@@ -54,42 +55,42 @@ const BUSINESS_TYPES = [
     label: "Retail / General Store",
     description: "Shops, supermarkets, kirana stores, boutiques",
     icon: ShoppingCart,
-    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "reports"],
+    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports"],
   },
   {
     id: "wholesaler",
     label: "Wholesaler",
     description: "Bulk distributors, wholesale dealers, B2B suppliers",
     icon: Boxes,
-    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "reports"],
+    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports"],
   },
   {
     id: "restaurant",
     label: "Restaurant / Food",
     description: "Restaurants, cafes, food trucks, catering",
     icon: ShoppingCart,
-    defaultModules: ["dashboard", "tables", "menu", "kot", "invoices", "expenses", "reports"],
+    defaultModules: ["dashboard", "tables", "menu", "kot", "invoices", "expenses", "analytics", "reports"],
   },
   {
     id: "school",
     label: "School",
     description: "Schools, coaching centers, tuition classes",
     icon: Users,
-    defaultModules: ["dashboard", "customers", "udhar", "expenses", "reports"],
+    defaultModules: ["dashboard", "customers", "udhar", "expenses", "analytics", "reports"],
   },
   {
     id: "services",
     label: "Services (salon, repair, etc.)",
     description: "Salons, repair shops, consultants, freelancers",
     icon: Package,
-    defaultModules: ["dashboard", "customers", "invoices", "expenses", "reports"],
+    defaultModules: ["dashboard", "customers", "invoices", "expenses", "analytics", "reports"],
   },
   {
     id: "other",
     label: "Other",
     description: "Any other business type - all modules available",
     icon: CircleHelp,
-    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "reports", "tables", "menu", "kot"],
+    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "tables", "menu", "kot"],
   },
 ];
 
@@ -100,6 +101,7 @@ const MODULE_KEYS = [
   { key: "invoices", label: "Invoices", icon: FileText },
   { key: "udhar", label: "Udhar (Credit)", icon: Wallet },
   { key: "expenses", label: "Expenses", icon: CreditCard },
+  { key: "analytics", label: "Analytics", icon: TrendingUp },
   { key: "reports", label: "Reports", icon: Boxes },
   { key: "tables", label: "Tables", icon: Table },
   { key: "menu", label: "Menu", icon: FileText },
@@ -325,8 +327,23 @@ function App() {
         onSaved={refresh}
         onError={reportError}
       />
+    ) : active === "Analytics" ? (
+      <AnalyticsView onError={reportError} notify={notify} />
     ) : active === "Reports" ? (
       <ReportsView dashboard={dashboard} />
+    ) : active === "Menu" ? (
+      <MenuView
+        products={products}
+        onSaved={refresh}
+        onError={reportError}
+      />
+    ) : active === "KOT" ? (
+      <KOTView
+        tables={tables}
+        products={products}
+        onError={reportError}
+        notify={notify}
+      />
     ) : active === "Tables" ? (
       <TablesView
         tables={tables}
@@ -346,6 +363,7 @@ function App() {
         user={user}
         enabledModules={enabledModules}
         setEnabledModules={setEnabledModules}
+        setUser={setUser}
       />
     ) : (
       <DashboardView
@@ -501,6 +519,8 @@ function App() {
           onClose={() => setModal(null)}
           onSaved={refresh}
           onError={reportError}
+          user={user}
+          notify={notify}
         />
       )}
       {modal === "payment" && (
@@ -995,6 +1015,368 @@ function ReportsView({ dashboard }) {
     </div>
   );
 }
+function AnalyticsView({ onError, notify }) {
+  const [analytics, setAnalytics] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [period, setPeriod] = useState('month')
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+
+  const fetchAnalytics = async () => {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ period })
+      if (startDate) params.append('startDate', startDate)
+      if (endDate) params.append('endDate', endDate)
+      const response = await api.get(`/analytics?${params.toString()}`)
+      setAnalytics(response.data)
+    } catch (error) {
+      onError('Load analytics', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchAnalytics()
+  }, [period, startDate, endDate, fetchAnalytics])
+
+  if (!analytics && loading) {
+    return (
+      <div className="section-view">
+        <PageHeading title="Business Analytics" subtitle="Sales, expenses, and profit insights" />
+        <div className="loading">Loading analytics...</div>
+      </div>
+    )
+  }
+
+  const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
+  const formatNumber = (value) => Number(value || 0).toLocaleString('en-IN')
+
+  const sales = analytics?.sales || {}
+  const expenses = analytics?.expenses || {}
+  const profit = analytics?.profit || {}
+  const topProducts = analytics?.topProducts || []
+  const outstanding = analytics?.outstanding || {}
+
+  const profitColor = profit.operatingProfit >= 0 ? 'var(--color-success)' : 'var(--color-danger)'
+  const grossProfitColor = profit.grossProfit >= 0 ? 'var(--color-success)' : 'var(--color-danger)'
+
+  return (
+    <div className="section-view">
+      <PageHeading title="Business Analytics" subtitle="Sales, expenses, and profit insights" />
+
+      <div className="card" style={{marginBottom: 'var(--spacing-lg)'}}>
+        <div className="card-body" style={{padding: 'var(--spacing-md) var(--spacing-lg)'}}>
+          <div style={{display: 'flex', gap: 'var(--spacing-md)', flexWrap: 'wrap', alignItems: 'end'}}>
+            <div className="form-group" style={{flex: 1, minWidth: '160px'}}>
+              <label className="form-label">Period</label>
+              <select className="form-select" value={period} onChange={(e) => { setPeriod(e.target.value); setStartDate(''); setEndDate(''); }}>
+                <option value="day">Today</option>
+                <option value="week">This Week</option>
+                <option value="month">This Month</option>
+                <option value="year">This Year</option>
+                <option value="custom">Custom Range</option>
+              </select>
+            </div>
+            {period === 'custom' && (
+              <>
+                <div className="form-group" style={{flex: 1, minWidth: '160px'}}>
+                  <label className="form-label">From</label>
+                  <input type="date" className="form-input" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+                </div>
+                <div className="form-group" style={{flex: 1, minWidth: '160px'}}>
+                  <label className="form-label">To</label>
+                  <input type="date" className="form-input" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+                </div>
+              </>
+            )}
+            <button className="btn btn-primary" onClick={fetchAnalytics} disabled={loading} style={{height: 'fit-content'}}>
+              <Search size={16} /> Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 'var(--spacing-md)', marginBottom: 'var(--spacing-lg)'}}>
+        <div className="card kpi">
+          <div className="kpi-top">
+            <span>Total Sales</span>
+            <div className="kpi-icon"><ShoppingCart size={17} /></div>
+          </div>
+          <strong style={{fontSize: 'var(--font-size-2xl)'}}>{formatCurrency(sales.total)}</strong>
+          <small>{sales.invoiceCount} invoices · {formatCurrency(sales.paid)} paid</small>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-top">
+            <span>Total Expenses</span>
+            <div className="kpi-icon"><CreditCard size={17} /></div>
+          </div>
+          <strong style={{fontSize: 'var(--font-size-2xl)', color: 'var(--color-danger)'}}>{formatCurrency(expenses.total)}</strong>
+          <small>{expenses.byCategory?.length || 0} categories</small>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-top">
+            <span>Gross Profit</span>
+            <div className="kpi-icon"><Wallet size={17} /></div>
+          </div>
+          <strong style={{fontSize: 'var(--font-size-2xl)', color: grossProfitColor}}>{formatCurrency(profit.grossProfit)}</strong>
+          <small>Margin: {profit.grossMargin}% · Revenue: {formatCurrency(profit.revenue)}</small>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-top">
+            <span>Operating Profit</span>
+            <div className="kpi-icon"><Zap size={17} /></div>
+          </div>
+          <strong style={{fontSize: 'var(--font-size-2xl)', color: profitColor}}>{formatCurrency(profit.operatingProfit)}</strong>
+          <small>Margin: {profit.operatingMargin}% · Expenses: {formatCurrency(profit.expenses)}</small>
+        </div>
+        <div className="card kpi">
+          <div className="kpi-top">
+            <span>Outstanding</span>
+            <div className="kpi-icon"><Users size={17} /></div>
+          </div>
+          <strong style={{fontSize: 'var(--font-size-2xl)', color: 'var(--color-warning)'}}>{formatCurrency(outstanding.total)}</strong>
+          <small>{outstanding.customers?.length || 0} customers</small>
+        </div>
+      </div>
+
+      <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: 'var(--spacing-lg)'}}>
+        <div className="card">
+          <div className="card-body">
+            <h3 style={{marginBottom: 'var(--spacing-md)'}}>Sales Trend</h3>
+            {sales.byDay?.length ? (
+              <div style={{height: '280px', position: 'relative'}}>
+                <SalesChart data={sales.byDay} />
+              </div>
+            ) : (
+              <div className="empty-state" style={{padding: 'var(--spacing-xl)'}}>
+                <ShoppingCart size={28} />
+                <strong>No sales data</strong>
+                <span>Create invoices to see sales trends.</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-body">
+            <h3 style={{marginBottom: 'var(--spacing-md)'}}>Expenses by Category</h3>
+            {expenses.byCategory?.length ? (
+              <div style={{height: '280px', position: 'relative'}}>
+                <ExpenseChart data={expenses.byCategory} />
+              </div>
+            ) : (
+              <div className="empty-state" style={{padding: 'var(--spacing-xl)'}}>
+                <CreditCard size={28} />
+                <strong>No expense data</strong>
+                <span>Add expenses to see breakdown.</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: 'var(--spacing-lg)', marginTop: 'var(--spacing-lg)'}}>
+        <div className="card">
+          <div className="card-body">
+            <h3 style={{marginBottom: 'var(--spacing-md)'}}>Top Selling Products</h3>
+            {topProducts.length ? (
+              <div className="table-responsive">
+                <table style={{width: '100%', borderCollapse: 'collapse'}}>
+                  <thead>
+                    <tr style={{borderBottom: '1px solid var(--color-border)'}}>
+                      <th style={{textAlign: 'left', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Product</th>
+                      <th style={{textAlign: 'left', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Category</th>
+                      <th style={{textAlign: 'right', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Qty</th>
+                      <th style={{textAlign: 'right', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Revenue</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topProducts.map((product, index) => (
+                      <tr key={index} style={{borderBottom: '1px solid var(--color-border)'}}>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)'}}><strong>{product.name}</strong></td>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>{product.category || '—'}</td>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', textAlign: 'right'}}>{formatNumber(product.quantity)}</td>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', textAlign: 'right', fontWeight: 500}}>{formatCurrency(product.revenue)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state" style={{padding: 'var(--spacing-xl)'}}>
+                <Package size={28} />
+                <strong>No product sales</strong>
+                <span>Create invoices with products to see top sellers.</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-body">
+            <h3 style={{marginBottom: 'var(--spacing-md)'}}>Outstanding Balances</h3>
+            {outstanding.customers?.length ? (
+              <div className="table-responsive">
+                <table style={{width: '100%', borderCollapse: 'collapse'}}>
+                  <thead>
+                    <tr style={{borderBottom: '1px solid var(--color-border)'}}>
+                      <th style={{textAlign: 'left', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Customer</th>
+                      <th style={{textAlign: 'left', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Phone</th>
+                      <th style={{textAlign: 'right', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {outstanding.customers.map((customer, index) => (
+                      <tr key={index} style={{borderBottom: '1px solid var(--color-border)'}}>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)'}}><strong>{customer.name}</strong></td>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)'}}>{customer.phone || '—'}</td>
+                        <td style={{padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-sm)', textAlign: 'right', color: 'var(--color-danger)', fontWeight: 600}}>{formatCurrency(customer.balance)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state" style={{padding: 'var(--spacing-xl)'}}>
+                <Wallet size={28} />
+                <strong>No outstanding balances</strong>
+                <span>All customers are up to date.</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="card" style={{marginTop: 'var(--spacing-lg)', background: 'var(--color-info-bg)', border: '1px solid var(--color-info-border)'}}>
+        <div className="card-body">
+          <div style={{display: 'flex', gap: 'var(--spacing-sm)', alignItems: 'flex-start'}}>
+            <CircleHelp size={20} style={{color: 'var(--color-info)', marginTop: '2px', flexShrink: 0}} />
+            <div style={{fontSize: 'var(--font-size-sm)', color: 'var(--color-info-text)', lineHeight: 'var(--line-height-relaxed)'}}>
+              <strong>Profit Calculation Notes:</strong>
+              <ul style={{margin: 'var(--spacing-xs) 0 0 var(--spacing-lg)', padding: 0}}>
+                <li><strong>Gross Profit</strong> = Revenue - COGS (Cost of Goods Sold). COGS is estimated from product purchase_price × quantity sold.</li>
+                <li><strong>Operating Profit</strong> = Gross Profit - Operating Expenses (from expenses table).</li>
+                <li>These are <strong>estimates</strong>. Actual net profit requires accounting for taxes, depreciation, payroll, rent, and other overheads not tracked here.</li>
+                <li>Ensure product <strong>purchase_price</strong> is set accurately for meaningful COGS calculation.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function SalesChart({ data }) {
+  if (!data.length) return null
+  const maxSales = Math.max(...data.map(d => d.sales))
+  const height = 260
+  const padding = { top: 20, right: 40, bottom: 40, left: 50 }
+  const chartWidth = `calc(100% - ${padding.left + padding.right}px)`
+  const chartHeight = height - padding.top - padding.bottom
+
+  return (
+    <svg width="100%" height={height} style={{display: 'block'}}>
+      <defs>
+        <linearGradient id="salesGradient" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="var(--color-primary)" stopOpacity="0.3" />
+          <stop offset="100%" stopColor="var(--color-primary)" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <g transform={`translate(${padding.left},${padding.top})`}>
+        <rect width={chartWidth} height={chartHeight} fill="url(#salesGradient)" />
+        <path
+          d={data.map((d, i) => {
+            const x = (i / (data.length - 1 || 1)) * chartWidth
+            const y = chartHeight - (d.sales / (maxSales || 1)) * chartHeight
+            return `${i === 0 ? 'M' : 'L'} ${x} ${y}`
+          }).join(' ')}
+          stroke="var(--color-primary)"
+          strokeWidth="2"
+          fill="none"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {data.map((d, i) => {
+          const x = (i / (data.length - 1 || 1)) * chartWidth
+          const y = chartHeight - (d.sales / (maxSales || 1)) * chartHeight
+          return (
+            <circle key={i} cx={x} cy={y} r={4} fill="var(--color-primary)" stroke="var(--color-bg)" strokeWidth={2} />
+          )
+        })}
+      </g>
+      <g transform={`translate(${padding.left},${height - padding.bottom})`} style={{fontSize: '10px', fill: 'var(--color-text-muted)'}}>
+        {data.map((d, i) => (
+          <text key={i} x={(i / (data.length - 1 || 1)) * chartWidth} y={15} textAnchor="middle" dominantBaseline="hanging">
+            {new Date(d.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
+          </text>
+        ))}
+      </g>
+      <g transform={`translate(${padding.left - 40},${padding.top})`} style={{fontSize: '10px', fill: 'var(--color-text-muted)'}}>
+        {[0, 0.25, 0.5, 0.75, 1].map((frac) => (
+          <text key={frac} x={-5} y={chartHeight * (1 - frac)} textAnchor="end" dominantBaseline="middle">
+            {formatCurrency(maxSales * frac)}
+          </text>
+        ))}
+      </g>
+    </svg>
+  )
+}
+
+function ExpenseChart({ data }) {
+  if (!data.length) return null
+  const total = data.reduce((sum, d) => sum + d.total, 0)
+  const radius = 100
+  const centerX = 120
+  const centerY = 130
+  const colors = ['var(--color-primary)', 'var(--color-success)', 'var(--color-warning)', 'var(--color-danger)', 'var(--color-info)', 'var(--color-purple)', 'var(--color-pink)', 'var(--color-teal)']
+
+  return (
+    <div style={{display: 'flex', gap: 'var(--spacing-lg)', alignItems: 'center', justifyContent: 'center', height: '280px'}}>
+      <svg width={240} height={260} viewBox="0 0 240 260">
+        {data.map((d, i) => {
+          const percentage = d.total / total
+          const startAngle = data.slice(0, i).reduce((sum, item) => sum + (item.total / total) * 360, 0)
+          const endAngle = startAngle + percentage * 360
+          const largeArc = percentage > 0.5 ? 1 : 0
+          const startX = centerX + radius * Math.cos((startAngle - 90) * Math.PI / 180)
+          const startY = centerY + radius * Math.sin((startAngle - 90) * Math.PI / 180)
+          const endX = centerX + radius * Math.cos((endAngle - 90) * Math.PI / 180)
+          const endY = centerY + radius * Math.sin((endAngle - 90) * Math.PI / 180)
+          return (
+            <path
+              key={i}
+              d={`M ${centerX} ${centerY} L ${startX} ${startY} A ${radius} ${radius} 0 ${largeArc} 1 ${endX} ${endY} Z`}
+              fill={colors[i % colors.length]}
+              stroke="var(--color-bg)"
+              strokeWidth={2}
+            />
+          )
+        })}
+        <circle cx={centerX} cy={centerY} r={50} fill="var(--color-bg)" />
+        <text x={centerX} y={centerY - 5} textAnchor="middle" dominantBaseline="middle" fontSize="18" fontWeight="bold" fill="var(--color-text)" fontFamily="Georgia, serif">
+          {formatCurrency(total)}
+        </text>
+        <text x={centerX} y={centerY + 15} textAnchor="middle" dominantBaseline="middle" fontSize="10" fill="var(--color-text-secondary)">
+          Total Expenses
+        </text>
+      </svg>
+      <div style={{flex: 1, maxWidth: '300px'}}>
+        {data.map((d, i) => (
+          <div key={i} style={{display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)', marginBottom: 'var(--spacing-sm)', padding: 'var(--spacing-xs) var(--spacing-sm)', background: 'var(--color-surface)', borderRadius: 'var(--radius-sm)'}}>
+            <div style={{width: 12, height: 12, borderRadius: '50%', background: colors[i % colors.length]}} />
+            <span style={{flex: 1, fontSize: 'var(--font-size-sm)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'}}>{d.category}</span>
+            <span style={{fontSize: 'var(--font-size-sm)', fontWeight: 600, color: 'var(--color-text)'}}>{formatCurrency(d.total)}</span>
+            <span style={{fontSize: 'var(--font-size-xs)', color: 'var(--color-text-secondary)'}}>{((d.total / total) * 100).toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function groupProductsByCategory(products) {
   const grouped = {};
   products.forEach(product => {
@@ -1546,12 +1928,263 @@ function TablesView({ tables, restaurantSettings, onSaved, onError, notify, prod
     </div>
   );
 }
-function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enabledModules, setEnabledModules }) {
+function MenuView({ products, onSaved, onError }) {
+  const [showModal, setShowModal] = useState(false);
+  const [editingProduct, setEditingProduct] = useState(null);
+  const [form, setForm] = useState({
+    name: "",
+    category: "",
+    sellingPrice: "",
+    currentStock: "",
+    unit: "piece",
+    lowStockThreshold: 5,
+  });
+
+  const categories = [...new Set(products.map(p => p.category || "Uncategorized"))].sort();
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      if (editingProduct) {
+        await api.put(`/products/${editingProduct.id}`, form);
+      } else {
+        await api.post("/products", form);
+      }
+      setShowModal(false);
+      setEditingProduct(null);
+      setForm({ name: "", category: "", sellingPrice: "", currentStock: "", unit: "piece", lowStockThreshold: 5 });
+      await onSaved();
+    } catch (error) {
+      onError("Save menu item", error);
+    }
+  };
+
+  const handleEdit = (product) => {
+    setEditingProduct(product);
+    setForm({
+      name: product.name,
+      category: product.category || "",
+      sellingPrice: product.selling_price,
+      currentStock: product.current_stock,
+      unit: product.unit || "piece",
+      lowStockThreshold: product.low_stock_threshold || 5,
+    });
+    setShowModal(true);
+  };
+
+  const handleDelete = async (id) => {
+    if (!window.confirm("Delete this menu item?")) return;
+    try {
+      await api.delete(`/products/${id}`);
+      await onSaved();
+    } catch (error) {
+      onError("Delete menu item", error);
+    }
+  };
+
+  const handleNew = () => {
+    setEditingProduct(null);
+    setForm({ name: "", category: "", sellingPrice: "", currentStock: "", unit: "piece", lowStockThreshold: 5 });
+    setShowModal(true);
+  };
+
+  const grouped = {};
+  products.forEach(p => {
+    const cat = p.category || "Uncategorized";
+    if (!grouped[cat]) grouped[cat] = [];
+    grouped[cat].push(p);
+  });
+
+  return (
+    <div className="section-view">
+      <PageHeading title="Menu Management" subtitle="Manage your restaurant menu items" action="Add Menu Item" onAction={handleNew} />
+      {Object.keys(grouped).length === 0 ? (
+        <div className="empty-state">
+          <FileText size={28} />
+          <strong>No menu items yet</strong>
+          <span>Add your first menu item to get started.</span>
+        </div>
+      ) : (
+        <div className="card">
+          {Object.entries(grouped).map(([category, items]) => (
+            <div key={category} style={{marginBottom: 'var(--spacing-xl)'}}>
+              <h4 style={{margin: '0 0 var(--spacing-md) var(--spacing-xl)', padding: '0 var(--spacing-xl)', fontSize: 'var(--font-size-lg)', color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: '1px solid var(--color-border)', paddingBottom: 'var(--spacing-sm)'}}>
+                {category}
+              </h4>
+              <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--spacing-md)', padding: '0 var(--spacing-xl) var(--spacing-xl)'}}>
+                {items.map(item => (
+                  <div key={item.id} className="menu-item-tile" style={{display: 'flex', flexDirection: 'column', padding: 'var(--spacing-md)', background: 'var(--color-surface)', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)', gap: 'var(--spacing-sm)'}}>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start'}}>
+                      <div>
+                        <strong style={{fontSize: 'var(--font-size-base)'}}>{item.name}</strong>
+                        {item.sku && <span style={{fontSize: 'var(--font-size-xs)', color: 'var(--color-text-muted)'}}>{item.sku}</span>}
+                      </div>
+                      <span style={{fontSize: 'var(--font-size-lg)', fontWeight: 700, color: 'var(--color-primary)'}}>
+                        ₹{Number(item.selling_price).toFixed(2)}
+                      </span>
+                    </div>
+                    <div style={{display: 'flex', gap: 'var(--spacing-xs)', fontSize: 'var(--font-size-xs)', color: 'var(--color-text-muted)'}}>
+                      <span>Stock: {item.current_stock} {item.unit || 'pcs'}</span>
+                      {Number(item.current_stock) <= Number(item.low_stock_threshold) && (
+                        <span style={{color: 'var(--color-warning)'}}>⚠ Low</span>
+                      )}
+                    </div>
+                    <div style={{display: 'flex', gap: 'var(--spacing-sm)', marginTop: 'var(--spacing-xs)'}}>
+                      <button className="btn btn-secondary btn-sm" onClick={() => handleEdit(item)} style={{flex: 1}}>Edit</button>
+                      <button className="btn btn-danger btn-sm" onClick={() => handleDelete(item.id)} style={{flex: 1}}>Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showModal && (
+        <Modal title={editingProduct ? "Edit Menu Item" : "Add Menu Item"} onClose={() => { setShowModal(false); setEditingProduct(null); setForm({ name: "", category: "", sellingPrice: "", currentStock: "", unit: "piece", lowStockThreshold: 5 }); }}>
+          <form onSubmit={handleSubmit}>
+            <div className="form-group">
+              <label className="form-label">Name</label>
+              <input type="text" className="form-input" value={form.name} onChange={e => setForm({...form, name: e.target.value})} required />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Category</label>
+              <select className="form-select" value={form.category} onChange={e => setForm({...form, category: e.target.value})}>
+                {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                <option value="">New Category...</option>
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Selling Price</label>
+              <input type="number" className="form-input" value={form.sellingPrice} onChange={e => setForm({...form, sellingPrice: e.target.value})} required min="0" step="0.01" />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Current Stock</label>
+              <input type="number" className="form-input" value={form.currentStock} onChange={e => setForm({...form, currentStock: e.target.value})} required min="0" />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Unit</label>
+              <input type="text" className="form-input" value={form.unit} onChange={e => setForm({...form, unit: e.target.value})} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Low Stock Threshold</label>
+              <input type="number" className="form-input" value={form.lowStockThreshold} onChange={e => setForm({...form, lowStockThreshold: Number(e.target.value)})} required min="1" />
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function KOTView({ tables, products, onError, notify }) {
+  const [selectedTableId, setSelectedTableId] = useState("");
+  const [kotData, setKotData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [showPrint, setShowPrint] = useState(false);
+
+  const handleLoadKOT = async () => {
+    if (!selectedTableId) return;
+    setLoading(true);
+    try {
+      const response = await api.get(`/restaurant/tables/${selectedTableId}/kot`);
+      setKotData(response.data);
+      setShowPrint(true);
+    } catch (error) {
+      onError("Load KOT", error);
+      setShowPrint(false);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const occupiedTables = tables.filter(t => t.status === "occupied");
+
+  if (occupiedTables.length === 0) {
+    return (
+      <div className="section-view">
+        <PageHeading title="KOT (Kitchen Order Ticket)" subtitle="Generate kitchen tickets for active tables" />
+        <div className="empty-state">
+          <Bell size={28} />
+          <strong>No occupied tables</strong>
+          <span>Tables must be occupied with active orders to generate KOT.</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="section-view">
+      <PageHeading title="KOT (Kitchen Order Ticket)" subtitle="Generate and print kitchen tickets for active orders" />
+      <div className="card" style={{maxWidth: '480px'}}>
+        <div className="card-body">
+          <div className="form-group">
+            <label className="form-label">Select Table</label>
+            <select className="form-select" value={selectedTableId} onChange={e => setSelectedTableId(e.target.value)}>
+              <option value="">-- Choose a table --</option>
+              {occupiedTables.map(t => (
+                <option key={t.id} value={t.id}>Table {t.table_number} {t.customer_name ? `({t.customer_name})` : ""}</option>
+              ))}
+            </select>
+          </div>
+          <button className="btn btn-primary btn-full" onClick={handleLoadKOT} disabled={loading || !selectedTableId}>
+            {loading ? "Generating..." : "Generate KOT"}
+          </button>
+        </div>
+      </div>
+
+      {showPrint && kotData && (
+        <div className="modal-backdrop" onClick={() => setShowPrint(false)}>
+          <div className="modal kot-modal" style={{width: 'min(500px, 95vw)', maxHeight: '90vh'}} onClick={e => e.stopPropagation()}>
+            <div className="kot-view" style={{padding: 'var(--spacing-xl)'}}>
+              <div className="kot-header" style={{textAlign: 'center', marginBottom: 'var(--spacing-lg)', paddingBottom: 'var(--spacing-md)', borderBottom: '2px solid var(--color-text)'}}>
+                <h3 style={{margin: '0 0 var(--spacing-sm)', fontSize: 'var(--font-size-2xl)', fontWeight: 700, fontFamily: 'Georgia, serif'}}>{kotData.businessName}</h3>
+                <div className="kot-meta" style={{display: 'flex', justifyContent: 'center', gap: 'var(--spacing-lg)', fontSize: 'var(--font-size-sm)', color: 'var(--color-text-muted)', flexWrap: 'wrap'}}>
+                  <span>Table: {kotData.tableNumber}</span>
+                  <span>Order: #{kotData.orderId}</span>
+                  <span>{new Date(kotData.timestamp).toLocaleString()}</span>
+                </div>
+              </div>
+              <div className="kot-items">
+                {kotData.items.map(item => (
+                  <div key={item.id} className="kot-item" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--spacing-md) var(--spacing-sm)', borderBottom: '1px dashed var(--color-border)'}}>
+                    <span className="kot-item-name" style={{flex: 1, fontSize: 'var(--font-size-base)'}}>{item.name}</span>
+                    <span className="kot-item-qty" style={{color: 'var(--color-text-secondary)', fontSize: 'var(--font-size-sm)', margin: '0 var(--spacing-md)', whiteSpace: 'nowrap'}}>
+                      x {Number(item.quantity).toLocaleString()}
+                    </span>
+                    <span className="kot-item-price" style={{fontSize: 'var(--font-size-base)', fontWeight: 600, whiteSpace: 'nowrap'}}>
+                      ₹{Number(item.price).toFixed(2)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="kot-total" style={{textAlign: 'right', padding: 'var(--spacing-md) var(--spacing-sm)', borderTop: '2px solid var(--color-text)', fontSize: 'var(--font-size-xl)', fontWeight: 700, fontFamily: 'Georgia, serif'}}>
+                Total: ₹{Number(kotData.totalAmount).toFixed(2)}
+              </div>
+              <div className="kot-actions" style={{display: 'flex', gap: 'var(--spacing-md)', justifyContent: 'center', marginTop: 'var(--spacing-lg)'}}>
+                <button className="btn btn-primary" onClick={() => window.print()}>
+                  Print KOT
+                </button>
+                <button className="btn btn-secondary" onClick={() => setShowPrint(false)}>
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enabledModules, setEnabledModules, setUser }) {
   const [totalTables, setTotalTables] = useState(restaurantSettings.totalTables || 0);
   const [saving, setSaving] = useState(false);
   const [moduleSaving, setModuleSaving] = useState(false);
+  const [businessType, setBusinessType] = useState(user?.businessType || "other");
+  const [typeSaving, setTypeSaving] = useState(false);
 
-  const businessType = user?.businessType || "other";
   const defaultModules = getEnabledModules(businessType);
   const availableModules = MODULE_KEYS.filter((m) => !m.required);
 
@@ -1597,6 +2230,21 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
     }
   };
 
+  const handleBusinessTypeChange = async (newType) => {
+    setBusinessType(newType);
+    setTypeSaving(true);
+    try {
+      const response = await api.post("/business/update-type", { category: newType });
+      setUser(response.data.user);
+      notify(`Business type updated to ${BUSINESS_TYPES.find(t => t.id === newType)?.label || newType}`);
+    } catch (error) {
+      onError("Update business type", error);
+      setBusinessType(user?.businessType || "other");
+    } finally {
+      setTypeSaving(false);
+    }
+  };
+
   const isModuleEnabled = (moduleKey) => {
     return defaultModules.includes(moduleKey) || enabledModules.includes(moduleKey);
   };
@@ -1609,6 +2257,37 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
     <div className="section-view">
       <PageHeading title="Settings" subtitle="Configure your business preferences" />
       <div className="settings-section">
+        <h3>Business Type</h3>
+        <p className="settings-description">Change your business type to enable the right modules for your needs. This will reset default modules based on the new type.</p>
+        <div className="module-grid">
+          {BUSINESS_TYPES.map((type) => (
+            <label
+              key={type.id}
+              className={`module-toggle ${businessType === type.id ? "enabled" : ""}`}
+              onClick={() => handleBusinessTypeChange(type.id)}
+              style={{cursor: 'pointer', opacity: typeSaving ? 0.7 : 1}}
+            >
+              <input
+                type="radio"
+                name="businessType"
+                checked={businessType === type.id}
+                onChange={() => handleBusinessTypeChange(type.id)}
+                style={{display: 'none'}}
+              />
+              <div className="module-toggle-content">
+                <type.icon size={20} className="module-toggle-icon" />
+                <div>
+                  <strong className="module-toggle-label">{type.label}</strong>
+                  <span className="module-toggle-desc">{type.description}</span>
+                </div>
+              </div>
+              <span className="module-toggle-switch" />
+            </label>
+          ))}
+        </div>
+        {typeSaving && <p className="settings-hint" style={{marginTop: 'var(--spacing-md)'}}>Updating business type...</p>}
+      </div>
+      <div className="settings-section" style={{marginTop: 'var(--spacing-xl)'}}>
         <h3>Enabled Modules</h3>
         <p className="settings-description">Turn modules on or off based on your needs. Default modules for your business type ({BUSINESS_TYPES.find((t) => t.id === businessType)?.label || "Other"}) are shown with a badge.</p>
         <div className="module-grid">
@@ -1621,7 +2300,6 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
                   type="checkbox"
                   checked={enabled}
                   onChange={() => handleModuleToggle(module.key)}
-                  disabled={isDefault}
                 />
                 <div className="module-toggle-content">
                   <module.icon size={20} className="module-toggle-icon" />
@@ -1670,15 +2348,24 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
     </div>
   );
 }
-function Modal({ title, children, onClose, className = "" }) {
+function Modal({ title, children, onClose, className = "", footer }) {
   return (
     <div className="modal-backdrop">
       <div className={`modal ${className}`}>
-        <button className="modal-close" onClick={onClose}>
-          <X size={18} />
-        </button>
-        <h2>{title}</h2>
-        {children}
+        <div className="modal-header">
+          <h2>{title}</h2>
+          <button className="modal-close" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="modal-body">
+          {children}
+        </div>
+        {footer && (
+          <div className="modal-footer">
+            {footer}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1704,8 +2391,16 @@ function ProductModal({ onClose, onSaved, onError }) {
       onError("Add product", error);
     }
   };
+  const footer = (
+    <button className="btn btn-primary btn-full" onClick={() => {
+      const formEl = document.querySelector('.modal-body form');
+      if (formEl) formEl.requestSubmit();
+    }}>
+      Save product
+    </button>
+  );
   return (
-    <Modal title="Add product" onClose={onClose}>
+    <Modal title="Add product" onClose={onClose} footer={footer}>
       <form onSubmit={submit}>
         <div className="form-group">
           <label className="form-label">Name</label>
@@ -1755,9 +2450,6 @@ function ProductModal({ onClose, onSaved, onError }) {
             required
           />
         </div>
-        <button className="btn btn-primary btn-full" type="submit">
-          Save product
-        </button>
       </form>
     </Modal>
   );
@@ -1780,8 +2472,16 @@ function CustomerModal({ onClose, onSaved, onError }) {
       onError("Add customer", error);
     }
   };
+  const footer = (
+    <button className="btn btn-primary btn-full" onClick={() => {
+      const formEl = document.querySelector('.modal-body form');
+      if (formEl) formEl.requestSubmit();
+    }}>
+      Save customer
+    </button>
+  );
   return (
-    <Modal title="Add customer" onClose={onClose}>
+    <Modal title="Add customer" onClose={onClose} footer={footer}>
       <form onSubmit={submit}>
         <div className="form-group">
           <label className="form-label">Name</label>
@@ -1820,47 +2520,145 @@ function CustomerModal({ onClose, onSaved, onError }) {
             onChange={(e) => setForm({ ...form, address: e.target.value })}
           />
         </div>
-        <button className="btn btn-primary btn-full" type="submit">
-          Save customer
-        </button>
       </form>
     </Modal>
   );
 }
-function InvoiceModal({ products, customers, onClose, onSaved, onError }) {
-  const [customerId, setCustomerId] = useState("");
-  const [productId, setProductId] = useState(products[0]?.id || "");
-  const [quantity, setQuantity] = useState(1);
-  const [paid, setPaid] = useState(0);
-  const product = products.find(
-    (item) => String(item.id) === String(productId),
-  );
-  const total = Number(product?.selling_price || 0) * Number(quantity || 0);
+function InvoiceModal({ products, customers, onClose, onSaved, onError, user, notify }) {
+  const [customerId, setCustomerId] = useState("")
+  const [items, setItems] = useState([{ productId: products[0]?.id || "", quantity: 1, gstPercent: 0, discountPercent: 0 }])
+  const [paid, setPaid] = useState(0)
+  const [gstEnabled, setGstEnabled] = useState(true)
+  const [generatingPdf, setGeneratingPdf] = useState(false)
+  const [invoiceId, setInvoiceId] = useState(null)
+
+  const getProduct = (productId) => products.find((p) => String(p.id) === String(productId))
+
+  const addItem = () => {
+    setItems([...items, { productId: products[0]?.id || "", quantity: 1, gstPercent: gstEnabled ? 18 : 0, discountPercent: 0 }])
+  }
+
+  const removeItem = (index) => {
+    if (items.length <= 1) return
+    setItems(items.filter((_, i) => i !== index))
+  }
+
+  const updateItem = (index, field, value) => {
+    setItems(items.map((item, i) => (i === index ? { ...item, [field]: value } : item)))
+  }
+
+  const calculateTotals = () => {
+    let subtotal = 0
+    let totalGst = 0
+    let totalDiscount = 0
+    items.forEach((item) => {
+      const product = getProduct(item.productId)
+      if (!product) return
+      const qty = Number(item.quantity) || 0
+      const price = Number(product.selling_price) || 0
+      const gstPercent = gstEnabled ? (Number(item.gstPercent) || 0) : 0
+      const discountPercent = Number(item.discountPercent) || 0
+      const itemTotal = qty * price
+      const discountAmount = (itemTotal * discountPercent) / 100
+      const taxableAmount = itemTotal - discountAmount
+      const gstAmount = (taxableAmount * gstPercent) / 100
+      subtotal += itemTotal
+      totalDiscount += discountAmount
+      totalGst += gstAmount
+    })
+    const cgst = totalGst / 2
+    const sgst = totalGst / 2
+    const grandTotal = subtotal - totalDiscount + totalGst
+    return { subtotal, totalDiscount, totalGst, cgst, sgst, grandTotal }
+  }
+
+  const { subtotal, totalDiscount, totalGst, cgst, sgst, grandTotal } = calculateTotals()
+
   const submit = async (event) => {
-    event.preventDefault();
+    event.preventDefault()
     try {
-      await api.post("/invoices", {
+      const invoiceItems = items
+        .filter((item) => item.productId)
+        .map((item) => {
+          const product = getProduct(item.productId)
+          const price = Number(product?.selling_price || 0)
+          const qty = Number(item.quantity) || 1
+          const itemTotal = qty * price
+          const discountPercent = Number(item.discountPercent) || 0
+          const discountAmount = (itemTotal * discountPercent) / 100
+          return {
+            productId: Number(item.productId),
+            quantity: qty,
+            price,
+            gstPercent: gstEnabled ? (Number(item.gstPercent) || 0) : 0,
+            discountPercent,
+            discountAmount,
+          }
+        })
+
+      if (!invoiceItems.length) return
+
+      const response = await api.post("/invoices", {
         customerId: customerId || null,
-        total,
+        total: grandTotal,
         paid,
-        status: Number(paid) >= total ? "paid" : paid > 0 ? "partial" : "udhar",
-        items: [
-          {
-            productId: Number(productId),
-            quantity: Number(quantity),
-            price: Number(product?.selling_price || 0),
-          },
-        ],
-      });
-      onClose();
-      await onSaved();
+        items: invoiceItems,
+      })
+
+      setInvoiceId(response.data.id)
+      notify("Invoice created successfully!")
+      await onSaved()
     } catch (error) {
-      console.error("[Bilkaro Create invoice]", error);
-      onError("Create invoice", error);
+      console.error("[Bilkaro Create invoice]", error)
+      onError("Create invoice", error)
     }
-  };
+  }
+
+  const handleDownloadPdf = async () => {
+    if (!invoiceId) return
+    setGeneratingPdf(true)
+    try {
+      const response = await api.post(`/invoices/${invoiceId}/pdf`, null, { responseType: 'blob' })
+      const url = window.URL.createObjectURL(new Blob([response.data], { type: 'application/pdf' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.setAttribute('download', `invoice-${invoiceId}.pdf`)
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error("[Bilkaro PDF generation]", error)
+      onError("Generate PDF", error)
+    } finally {
+      setGeneratingPdf(false)
+    }
+  }
+
+  const footer = (
+    <div style={{display: 'flex', gap: 'var(--spacing-md)', flexWrap: 'wrap', width: '100%'}}>
+      <button className="btn btn-primary btn-full" onClick={() => {
+        const formEl = document.querySelector('.modal-body form');
+        if (formEl) formEl.requestSubmit();
+      }} style={{flex: 1, minWidth: '200px'}}>
+        Save invoice
+      </button>
+      {invoiceId && (
+        <button
+          type="button"
+          className="btn btn-success btn-full"
+          onClick={handleDownloadPdf}
+          disabled={generatingPdf}
+          style={{flex: 1, minWidth: '200px'}}
+        >
+          {generatingPdf ? "Generating..." : "Download PDF"}
+        </button>
+      )}
+    </div>
+  );
+
   return (
-    <Modal title="Create invoice" onClose={onClose}>
+    <Modal title="Create invoice" onClose={onClose} className="invoice-modal" footer={footer}>
       <form onSubmit={submit}>
         <div className="form-group">
           <label className="form-label">Customer</label>
@@ -1877,53 +2675,171 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError }) {
             ))}
           </select>
         </div>
+
         <div className="form-group">
-          <label className="form-label">Product</label>
-          <select
-            className="form-select"
-            required
-            value={productId}
-            onChange={(event) => setProductId(event.target.value)}
-          >
-            {products.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name} · ₹{item.selling_price}
-              </option>
-            ))}
-          </select>
+          <label className="form-label" style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
+            GST Enabled
+            <input
+              type="checkbox"
+              checked={gstEnabled}
+              onChange={(e) => {
+                const enabled = e.target.checked
+                setGstEnabled(enabled)
+                if (!enabled) {
+                  setItems(items.map(item => ({ ...item, gstPercent: 0 })))
+                }
+              }}
+              style={{width: 'auto', marginLeft: 'var(--spacing-sm)'}}
+            />
+          </label>
         </div>
-        <div className="form-group">
-          <label className="form-label">Quantity</label>
-          <input
-            type="number"
-            className="form-input"
-            value={quantity}
-            onChange={(e) => setQuantity(Number(e.target.value))}
-            required
-            min="1"
-          />
+
+        <div className="invoice-items">
+          {items.map((item, index) => {
+            const product = getProduct(item.productId)
+            const price = Number(product?.selling_price || 0)
+            const qty = Number(item.quantity) || 0
+            const gstPercent = gstEnabled ? (Number(item.gstPercent) || 0) : 0
+            const discountPercent = Number(item.discountPercent) || 0
+            const itemTotal = price * qty
+            const discountAmount = (itemTotal * discountPercent) / 100
+            const taxableAmount = itemTotal - discountAmount
+            const gstAmount = (taxableAmount * gstPercent) / 100
+            const rowTotal = taxableAmount + gstAmount
+            return (
+              <div key={index} className="invoice-item-row" style={{display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 1fr auto', gap: 'var(--spacing-sm)', alignItems: 'end', padding: 'var(--spacing-sm)', background: 'var(--color-surface)', borderRadius: 'var(--radius-sm)', marginBottom: 'var(--spacing-sm)'}}>
+                <div>
+                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Product</label>
+                  <select
+                    className="form-select"
+                    value={item.productId}
+                    onChange={(e) => updateItem(index, 'productId', e.target.value)}
+                    style={{fontSize: 'var(--font-size-sm)'}}
+                  >
+                    {products.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name} · ₹{p.selling_price}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Qty</label>
+                  <input
+                    type="number"
+                    className="form-input"
+                    value={item.quantity}
+                    onChange={(e) => updateItem(index, 'quantity', Number(e.target.value) || 1)}
+                    min="1"
+                    style={{fontSize: 'var(--font-size-sm)'}}
+                  />
+                </div>
+                <div>
+                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Price</label>
+                  <input
+                    type="number"
+                    className="form-input"
+                    value={price.toFixed(2)}
+                    readOnly
+                    style={{fontSize: 'var(--font-size-sm)', background: 'var(--color-bg)'}}
+                  />
+                </div>
+                <div>
+                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Disc %</label>
+                  <input
+                    type="number"
+                    className="form-input"
+                    value={item.discountPercent}
+                    onChange={(e) => updateItem(index, 'discountPercent', Number(e.target.value) || 0)}
+                    min="0"
+                    max="100"
+                    step="0.5"
+                    style={{fontSize: 'var(--font-size-sm)'}}
+                  />
+                </div>
+                {gstEnabled && (
+                  <div>
+                    <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>GST %</label>
+                    <input
+                      type="number"
+                      className="form-input"
+                      value={item.gstPercent}
+                      onChange={(e) => updateItem(index, 'gstPercent', Number(e.target.value) || 0)}
+                      min="0"
+                      max="100"
+                      step="0.5"
+                      style={{fontSize: 'var(--font-size-sm)'}}
+                    />
+                  </div>
+                )}
+                <div style={{textAlign: 'right'}}>
+                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Total</label>
+                  <div style={{fontSize: 'var(--font-size-base)', fontWeight: 600, color: 'var(--color-primary)'}}>₹{rowTotal.toFixed(2)}</div>
+                </div>
+                {items.length > 1 && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => removeItem(index)}
+                    style={{height: 'fit-content', marginBottom: 'var(--spacing-xs)'}}
+                    aria-label="Remove item"
+                  >
+                    <X size={16} />
+                  </button>
+                )}
+              </div>
+            )
+          })}
+          <button type="button" className="btn btn-secondary" onClick={addItem} style={{width: 'fit-content', marginTop: 'var(--spacing-sm)'}}>
+            <Plus size={16} /> Add item
+          </button>
         </div>
+
+        <div className="invoice-totals" style={{marginTop: 'var(--spacing-lg)', padding: 'var(--spacing-md)', background: 'var(--color-surface)', borderRadius: 'var(--radius-md)'}}>
+          <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-xs)'}}>
+            <span>Subtotal</span>
+            <strong>₹{subtotal.toFixed(2)}</strong>
+          </div>
+          {totalDiscount > 0 && (
+            <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-xs)', color: 'var(--color-success)', fontSize: 'var(--font-size-sm)'}}>
+              <span>Discount</span>
+              <span>-₹{totalDiscount.toFixed(2)}</span>
+            </div>
+          )}
+          {gstEnabled && totalGst > 0 && (
+            <>
+              <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-xs)', color: 'var(--color-text-secondary)', fontSize: 'var(--font-size-sm)'}}>
+                <span>CGST</span>
+                <span>₹{cgst.toFixed(2)}</span>
+              </div>
+              <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-xs)', color: 'var(--color-text-secondary)', fontSize: 'var(--font-size-sm)'}}>
+                <span>SGST</span>
+                <span>₹{sgst.toFixed(2)}</span>
+              </div>
+              <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-sm)', fontWeight: 500}}>
+                <span>Total GST</span>
+                <span>₹{totalGst.toFixed(2)}</span>
+              </div>
+            </>
+          )}
+          <div style={{display: 'flex', justifyContent: 'space-between', paddingTop: 'var(--spacing-sm)', borderTop: '1px solid var(--color-border)', fontSize: 'var(--font-size-lg)', fontWeight: 700}}>
+            <span>Grand Total</span>
+            <span style={{color: 'var(--color-primary)', fontFamily: 'Georgia, serif'}}>₹{grandTotal.toFixed(2)}</span>
+          </div>
+        </div>
+
         <div className="form-group">
           <label className="form-label">Paid now</label>
           <input
             type="number"
             className="form-input"
             value={paid}
-            onChange={(e) => setPaid(Number(e.target.value))}
+            onChange={(e) => setPaid(Number(e.target.value) || 0)}
             min="0"
             step="0.01"
           />
         </div>
-        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: 'var(--spacing-md) 0', borderTop: '1px solid var(--color-border)', marginTop: 'var(--spacing-md)'}}>
-          <span style={{color: 'var(--color-text-secondary)', fontSize: 'var(--font-size-base)'}}>Total</span>
-          <strong style={{fontSize: 'var(--font-size-xl)', fontWeight: 700, color: 'var(--color-text)', fontFamily: 'Georgia, serif'}}>₹{total.toFixed(2)}</strong>
-        </div>
-        <button className="btn btn-primary btn-full" type="submit">
-          Save invoice
-        </button>
       </form>
     </Modal>
-  );
+  )
 }
 function PaymentModal({ customers, onClose, onSaved, onError }) {
   const [customerId, setCustomerId] = useState(customers[0]?.id || "");
@@ -1942,8 +2858,16 @@ function PaymentModal({ customers, onClose, onSaved, onError }) {
       onError("Record payment", error);
     }
   };
+  const footer = (
+    <button className="btn btn-primary btn-full" onClick={() => {
+      const formEl = document.querySelector('.modal-body form');
+      if (formEl) formEl.requestSubmit();
+    }}>
+      Save payment
+    </button>
+  );
   return (
-    <Modal title="Record payment" onClose={onClose}>
+    <Modal title="Record payment" onClose={onClose} footer={footer}>
       <form onSubmit={submit}>
         <div className="form-group">
           <label className="form-label">Customer</label>
@@ -1972,9 +2896,6 @@ function PaymentModal({ customers, onClose, onSaved, onError }) {
             step="0.01"
           />
         </div>
-        <button className="btn btn-primary btn-full" type="submit">
-          Save payment
-        </button>
       </form>
     </Modal>
   );
