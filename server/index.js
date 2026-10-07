@@ -27,127 +27,234 @@ const allowedOrigins = new Set(['http://localhost:5173', 'http://localhost:5174'
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
 app.use(express.json())
 
-const toBusiness = (business) => business && ({ id: business.id, name: business.name, ownerName: business.owner_name, email: business.email, phone: business.phone, category: business.category, businessType: business.category, businessDescription: business.business_description, isExisting: business.is_existing, yearsRunning: business.years_running, address: business.address })
-const tokenFor = (user) => jwt.sign({ id: user.id, email: user.email, category: user.category }, process.env.JWT_SECRET || 'bilkaro-local-secret', { expiresIn: '7d' })
+const JWT_SECRET = process.env.JWT_SECRET || 'bilkaro-local-secret'
+const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d'
+
+const toBusiness = (business) => business && ({ id: business.id, name: business.name, ownerName: business.owner_name, email: business.email, phone: business.phone, category: business.category, businessType: business.category, businessDescription: business.business_description, isExisting: business.is_existing, yearsRunning: business.years_running, address: business.address, enabledModules: business.enabled_modules || [] })
+
+const tokenFor = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRY })
+
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '')
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET || 'bilkaro-local-secret'); next() } catch { res.status(401).json({ error: 'Authentication required' }) }
+  if (!token) return res.status(401).json({ error: 'Authentication required' })
+  try { 
+    req.user = jwt.verify(token, JWT_SECRET)
+    next() 
+  } catch { res.status(401).json({ error: 'Invalid or expired token' }) }
+}
+
+const requireRole = (...roles) => (req, res, next) => {
+  if (!req.user?.role || !roles.includes(req.user.role)) {
+    return res.status(403).json({ error: `Access denied. Required role: ${roles.join(' or ')}` })
+  }
+  next()
+}
+
+const requirePermission = (permission) => (req, res, next) => {
+  const userRole = req.user?.role
+  const permissions = ROLE_PERMISSIONS[userRole] || []
+  if (!permissions.includes(permission)) {
+    return res.status(403).json({ error: `Permission required: ${permission}` })
+  }
+  next()
+}
+
+const ROLE_PERMISSIONS = {
+  owner: [
+    'dashboard.view', 'products.read', 'products.create', 'products.update', 'products.delete',
+    'customers.read', 'customers.create', 'customers.update', 'customers.delete',
+    'invoices.read', 'invoices.create', 'invoices.update', 'invoices.delete', 'invoices.export',
+    'expenses.read', 'expenses.create', 'expenses.update', 'expenses.delete',
+    'analytics.view', 'analytics.export',
+    'reports.view', 'reports.export',
+    'payments.create', 'payments.read',
+    'restaurant.view', 'restaurant.manage_tables', 'restaurant.manage_orders', 'restaurant.kot',
+    'settings.business_type', 'settings.restaurant', 'settings.modules', 'settings.team',
+    'users.invite', 'users.manage_roles', 'users.remove'
+  ],
+  manager: [
+    'dashboard.view', 'products.read', 'products.create', 'products.update', 'products.delete',
+    'customers.read', 'customers.create', 'customers.update', 'customers.delete',
+    'invoices.read', 'invoices.create', 'invoices.update', 'invoices.delete', 'invoices.export',
+    'expenses.read', 'expenses.create', 'expenses.update', 'expenses.delete',
+    'analytics.view', 'analytics.export',
+    'reports.view', 'reports.export',
+    'payments.create', 'payments.read',
+    'restaurant.view', 'restaurant.manage_tables', 'restaurant.manage_orders', 'restaurant.kot',
+    'settings.business_type', 'settings.restaurant', 'settings.modules'
+  ],
+  staff: [
+    'dashboard.view', 'products.read', 'customers.read', 'invoices.create', 'invoices.read'
+  ]
 }
 app.get('/api/health', async (_req, res) => res.json({ ok: true, database: Boolean(pool) }))
 app.post('/api/auth/signup', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Set DATABASE_URL to enable account creation' })
   const { businessName, ownerName, email, phone, password, category, businessDescription, isExisting, yearsRunning, address } = req.body
   const passwordHash = await bcrypt.hash(password, 12)
-  const result = await pool.query('INSERT INTO businesses (name, owner_name, email, phone, password_hash, category, business_description, is_existing, years_running, address) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address', [businessName, ownerName, email, phone, passwordHash, category, businessDescription, isExisting !== 'new', yearsRunning || null, address])
-  const user = result.rows[0]
-  res.status(201).json({ token: tokenFor(user), user: toBusiness(user) })
+  // Get default modules for business type
+  const defaultModulesMap = {
+    retail: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
+    wholesaler: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
+    restaurant: ["dashboard", "tables", "menu", "kot", "invoices", "expenses", "analytics", "reports", "team"],
+    school: ["dashboard", "customers", "udhar", "expenses", "analytics", "reports", "team"],
+    services: ["dashboard", "customers", "invoices", "expenses", "analytics", "reports", "team"],
+    other: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "tables", "menu", "kot", "team"]
+  }
+  const defaultModules = defaultModulesMap[category] || defaultModulesMap.other
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('INSERT INTO businesses (name, owner_name, email, phone, password_hash, category, business_description, is_existing, years_running, address, enabled_modules) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [businessName, ownerName, email, phone, passwordHash, category, businessDescription, isExisting !== 'new', yearsRunning || null, address, JSON.stringify(defaultModules)])
+    const business = result.rows[0]
+    // Create owner team member
+    await client.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5)', [business.id, ownerName, email, passwordHash, 'owner'])
+    await client.query('COMMIT')
+    const payload = { businessId: business.id, email, role: 'owner', userType: 'team_member' }
+    res.status(201).json({ token: tokenFor(payload), user: toBusiness(business) })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
 })
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Set DATABASE_URL to enable login' })
-  const result = await pool.query('SELECT * FROM businesses WHERE email = $1', [req.body.email])
+  const { email, password } = req.body
+  
+  // First check team_members table
+  let teamMember = await pool.query('SELECT * FROM team_members WHERE email = $1', [email])
+  if (teamMember.rows.length > 0) {
+    const member = teamMember.rows[0]
+    if (await bcrypt.compare(password, member.password_hash)) {
+      const business = await pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules FROM businesses WHERE id = $1', [member.business_id])
+      const payload = { businessId: member.business_id, email: member.email, role: member.role, userType: 'team_member', teamMemberId: member.id }
+      return res.json({ token: tokenFor(payload), user: toBusiness(business.rows[0]) })
+    }
+    return res.status(401).json({ error: 'Invalid email or password' })
+  }
+  
+  // Fallback to businesses table (legacy owner login)
+  const result = await pool.query('SELECT * FROM businesses WHERE email = $1', [email])
   const user = result.rows[0]
-  if (!user || !(await bcrypt.compare(req.body.password, user.password_hash))) return res.status(401).json({ error: 'Invalid email or password' })
-  res.json({ token: tokenFor(user), user: toBusiness(user) })
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Invalid email or password' })
+  
+  // Check if team_member exists for this business owner
+  const existingMember = await pool.query('SELECT * FROM team_members WHERE business_id = $1 AND email = $2', [user.id, email])
+  let role = 'owner'
+  if (existingMember.rows.length > 0) {
+    role = existingMember.rows[0].role
+  } else {
+    // Create team_member for legacy owner
+    await pool.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (business_id, email) DO NOTHING', [user.id, user.owner_name, email, user.password_hash, 'owner'])
+  }
+  
+  const payload = { businessId: user.id, email: user.email, role, userType: 'business_owner' }
+  res.json({ token: tokenFor(payload), user: toBusiness(user) })
 })
-app.get('/api/dashboard', auth, async (req, res) => {
+app.get('/api/dashboard', auth, requirePermission('dashboard.view'), async (req, res) => {
   if (!pool) return res.json({ business: null, salesToday: 0, customers: 0, lowStock: 0, outstandingUdhar: 0 })
-  const businessId = req.user.id
-  const [business, sales, customers, lowStock, udhar] = await Promise.all([
-    pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address FROM businesses WHERE id=$1', [businessId]),
+  const businessId = req.user.businessId
+  const [business, sales, customers, lowStock, udhar, teamMember] = await Promise.all([
+    pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules FROM businesses WHERE id=$1', [businessId]),
     pool.query('SELECT COALESCE(SUM(total),0) AS value FROM invoices WHERE business_id=$1 AND created_at::date=CURRENT_DATE', [businessId]),
     pool.query('SELECT COUNT(*) AS value FROM customers WHERE business_id=$1', [businessId]),
     pool.query('SELECT COUNT(*) AS value FROM products WHERE business_id=$1 AND current_stock <= low_stock_threshold', [businessId]),
     pool.query('SELECT COALESCE(SUM(balance),0) AS value FROM customers WHERE business_id=$1', [businessId]),
+    pool.query('SELECT role FROM team_members WHERE business_id=$1 AND email=$2', [businessId, req.user.email])
   ])
-  res.json({ business: toBusiness(business.rows[0]), salesToday: sales.rows[0].value, customers: customers.rows[0].value, lowStock: lowStock.rows[0].value, outstandingUdhar: udhar.rows[0].value })
+  const role = teamMember.rows[0]?.role || req.user.role || 'owner'
+  res.json({ business: toBusiness(business.rows[0]), salesToday: sales.rows[0].value, customers: customers.rows[0].value, lowStock: lowStock.rows[0].value, outstandingUdhar: udhar.rows[0].value, role })
 })
-app.get('/api/products', auth, async (req, res) => {
-  const result = await pool.query('SELECT id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold FROM products WHERE business_id=$1 ORDER BY name', [req.user.id])
+app.get('/api/products', auth, requirePermission('products.read'), async (req, res) => {
+  const result = await pool.query('SELECT id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold FROM products WHERE business_id=$1 ORDER BY name', [req.user.businessId])
   res.json(result.rows)
 })
-app.post('/api/products', auth, async (req, res) => {
+app.post('/api/products', auth, requirePermission('products.create'), async (req, res) => {
   const { name, sku, category, purchasePrice = 0, sellingPrice = 0, currentStock = 0, unit = 'piece', lowStockThreshold = 5 } = req.body
   if (!name) return res.status(400).json({ error: 'Product name is required' })
-  const result = await pool.query('INSERT INTO products (business_id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.id, name, sku, category, purchasePrice, sellingPrice, currentStock, unit, lowStockThreshold])
+  const result = await pool.query('INSERT INTO products (business_id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.businessId, name, sku, category, purchasePrice, sellingPrice, currentStock, unit, lowStockThreshold])
   res.status(201).json(result.rows[0])
 })
-app.delete('/api/products/:id', auth, async (req, res) => {
-  const result = await pool.query('DELETE FROM products WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.id])
+app.delete('/api/products/:id', auth, requirePermission('products.delete'), async (req, res) => {
+  const result = await pool.query('DELETE FROM products WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Product not found' })
   res.status(204).end()
 })
-app.get('/api/customers', auth, async (req, res) => {
-  const result = await pool.query('SELECT id, name, phone, email, address, balance FROM customers WHERE business_id=$1 ORDER BY name', [req.user.id])
+app.get('/api/customers', auth, requirePermission('customers.read'), async (req, res) => {
+  const result = await pool.query('SELECT id, name, phone, email, address, balance FROM customers WHERE business_id=$1 ORDER BY name', [req.user.businessId])
   res.json(result.rows)
 })
-app.post('/api/customers', auth, async (req, res) => {
+app.post('/api/customers', auth, requirePermission('customers.create'), async (req, res) => {
   const { name, phone, email, address } = req.body
   if (!name) return res.status(400).json({ error: 'Customer name is required' })
-  const result = await pool.query('INSERT INTO customers (business_id, name, phone, email, address) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.id, name, phone, email, address])
+  const result = await pool.query('INSERT INTO customers (business_id, name, phone, email, address) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.businessId, name, phone, email, address])
   res.status(201).json(result.rows[0])
 })
-app.delete('/api/customers/:id', auth, async (req, res) => {
-  const result = await pool.query('DELETE FROM customers WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.id])
+app.delete('/api/customers/:id', auth, requirePermission('customers.delete'), async (req, res) => {
+  const result = await pool.query('DELETE FROM customers WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Customer not found' })
   res.status(204).end()
 })
-app.post('/api/invoices', auth, async (req, res) => {
+app.post('/api/invoices', auth, requirePermission('invoices.create'), async (req, res) => {
   const { customerId, items = [], total, paid = 0, status } = req.body
   if (!items.length || !total) return res.status(400).json({ error: 'Invoice items and total are required' })
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    const customer = customerId ? await client.query('SELECT id FROM customers WHERE id=$1 AND business_id=$2', [customerId, req.user.id]) : { rows: [{ id: null }] }
+    const customer = customerId ? await client.query('SELECT id FROM customers WHERE id=$1 AND business_id=$2', [customerId, req.user.businessId]) : { rows: [{ id: null }] }
     if (!customer.rows.length) throw Object.assign(new Error('Customer does not belong to this business'), { status: 403 })
     for (const item of items) {
-      const product = await client.query('SELECT id, current_stock FROM products WHERE id=$1 AND business_id=$2 FOR UPDATE', [item.productId, req.user.id])
+      const product = await client.query('SELECT id, current_stock FROM products WHERE id=$1 AND business_id=$2 FOR UPDATE', [item.productId, req.user.businessId])
       if (!product.rows.length) throw Object.assign(new Error('Product does not belong to this business'), { status: 403 })
       if (Number(product.rows[0].current_stock) < Number(item.quantity)) throw Object.assign(new Error(`Insufficient stock for product ${item.productId}`), { status: 400 })
     }
-    const udharEnabledTypes = ['retail', 'wholesaler', 'school', 'other']
-    const businessCategory = req.user.category || 'other'
-    const hasUdhar = udharEnabledTypes.includes(businessCategory)
+    // Check if Udhar module is enabled for this business
+    const businessResult = await client.query('SELECT enabled_modules FROM businesses WHERE id=$1', [req.user.businessId])
+    const enabledModules = businessResult.rows[0]?.enabled_modules || []
+    const hasUdhar = Array.isArray(enabledModules) && enabledModules.includes('udhar')
     const defaultStatus = !status ? (Number(paid) >= total ? 'paid' : Number(paid) > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid')) : status
-    const invoice = await client.query('INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.id, customerId || null, total, paid, defaultStatus])
+    const invoice = await client.query('INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.businessId, customerId || null, total, paid, defaultStatus])
     for (const item of items) {
       await client.query('INSERT INTO invoice_items (invoice_id, product_id, quantity, price, gst_percent, discount_percent, discount_amount) VALUES ($1,$2,$3,$4,$5,$6,$7)', [invoice.rows[0].id, item.productId, item.quantity, item.price, item.gstPercent || 0, item.discountPercent || 0, item.discountAmount || 0])
-      await client.query('UPDATE products SET current_stock=current_stock-$1 WHERE id=$2 AND business_id=$3', [item.quantity, item.productId, req.user.id])
+      await client.query('UPDATE products SET current_stock=current_stock-$1 WHERE id=$2 AND business_id=$3', [item.quantity, item.productId, req.user.businessId])
     }
     const due = Math.max(Number(total) - Number(paid), 0)
     if (customerId && due > 0) {
-      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.id])
+      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.businessId])
       await client.query("INSERT INTO udhar_ledger (customer_id, invoice_id, type, amount, note) VALUES ($1,$2,'credit',$3,'Invoice credit')", [customerId, invoice.rows[0].id, due])
     }
     await client.query('COMMIT')
     res.status(201).json(invoice.rows[0])
   } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
 })
-app.get('/api/invoices', auth, async (req, res) => {
-  const result = await pool.query('SELECT i.id, i.total, i.paid, i.status, i.created_at, c.name AS customer_name, c.phone AS customer_phone FROM invoices i LEFT JOIN customers c ON c.id=i.customer_id WHERE i.business_id=$1 ORDER BY i.created_at DESC', [req.user.id])
+app.get('/api/invoices', auth, requirePermission('invoices.read'), async (req, res) => {
+  const result = await pool.query('SELECT i.id, i.total, i.paid, i.status, i.created_at, c.name AS customer_name, c.phone AS customer_phone FROM invoices i LEFT JOIN customers c ON c.id=i.customer_id WHERE i.business_id=$1 ORDER BY i.created_at DESC', [req.user.businessId])
   res.json(result.rows)
 })
-app.get('/api/expenses', auth, async (req, res) => {
-  const result = await pool.query('SELECT * FROM expenses WHERE business_id=$1 ORDER BY expense_date DESC', [req.user.id])
+app.get('/api/expenses', auth, requirePermission('expenses.read'), async (req, res) => {
+  const result = await pool.query('SELECT * FROM expenses WHERE business_id=$1 ORDER BY expense_date DESC', [req.user.businessId])
   res.json(result.rows)
 })
-app.post('/api/expenses', auth, async (req, res) => {
+app.post('/api/expenses', auth, requirePermission('expenses.create'), async (req, res) => {
   const { category, amount, note, expense_date, branch_id } = req.body
   if (!category || !amount || !expense_date) return res.status(400).json({ error: 'Category, amount, and date are required' })
   const result = await pool.query(
     'INSERT INTO expenses (business_id, branch_id, category, amount, note, expense_date) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [req.user.id, branch_id || null, category, amount, note, expense_date]
+    [req.user.businessId, branch_id || null, category, amount, note, expense_date]
   )
   res.status(201).json(result.rows[0])
 })
-app.delete('/api/expenses/:id', auth, async (req, res) => {
-  const result = await pool.query('DELETE FROM expenses WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.id])
+app.delete('/api/expenses/:id', auth, requirePermission('expenses.delete'), async (req, res) => {
+  const result = await pool.query('DELETE FROM expenses WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Expense not found' })
   res.status(204).end()
 })
 
-app.get('/api/analytics', auth, async (req, res) => {
+app.get('/api/analytics', auth, requirePermission('analytics.view'), async (req, res) => {
   if (!pool) return res.json({ sales: {}, expenses: {}, profit: {}, topProducts: [], outstanding: {} })
-  const businessId = req.user.id
+  const businessId = req.user.businessId
   const { period = 'month', startDate, endDate } = req.query
 
   let dateFilter = ''
@@ -201,7 +308,7 @@ app.get('/api/analytics', auth, async (req, res) => {
         ORDER BY total_revenue DESC
         LIMIT 10
       `, dateParams),
-      pool.query(`SELECT c.name, c.phone, c.balance FROM customers WHERE business_id=$1 AND balance > 0 ORDER BY c.balance DESC LIMIT 20`, [businessId]),
+      pool.query(`SELECT c.name, c.phone, c.balance FROM customers c WHERE business_id=$1 AND balance > 0 ORDER BY c.balance DESC LIMIT 20`, [businessId]),
       pool.query(`
         SELECT 
           COALESCE(SUM(i.total),0) as revenue,
@@ -260,27 +367,28 @@ app.get('/api/analytics', auth, async (req, res) => {
   }
 })
 
-app.get('/api/restaurant/settings', auth, async (req, res) => {
+app.get('/api/restaurant/settings', auth, requirePermission('restaurant.view'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
-  const result = await pool.query('SELECT total_tables FROM restaurant_settings WHERE business_id=$1', [req.user.id])
+  const result = await pool.query('SELECT total_tables FROM restaurant_settings WHERE business_id=$1', [req.user.businessId])
   res.json({ totalTables: result.rows[0]?.total_tables || 0 })
 })
 
-app.post('/api/restaurant/settings', auth, async (req, res) => {
+app.post('/api/restaurant/settings', auth, requirePermission('settings.restaurant'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const { totalTables } = req.body
   if (typeof totalTables !== 'number' || totalTables < 0 || totalTables > 100) {
     return res.status(400).json({ error: 'Total tables must be a number between 0 and 100' })
   }
+  const businessId = req.user.businessId
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
     await client.query(
       'INSERT INTO restaurant_settings (business_id, total_tables, updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (business_id) DO UPDATE SET total_tables=$2, updated_at=NOW()',
-      [req.user.id, totalTables]
+      [businessId, totalTables]
     )
     if (totalTables > 0) {
-      const existing = await client.query('SELECT table_number FROM restaurant_tables WHERE business_id=$1', [req.user.id])
+      const existing = await client.query('SELECT table_number FROM restaurant_tables WHERE business_id=$1', [businessId])
       const existingNumbers = new Set(existing.rows.map(r => r.table_number))
       const toInsert = []
       for (let i = 1; i <= totalTables; i++) {
@@ -290,14 +398,14 @@ app.post('/api/restaurant/settings', auth, async (req, res) => {
         const values = toInsert.map((_, idx) => `($1, $${idx + 2}, 'vacant', NOW(), NOW())`).join(',')
         await client.query(
           `INSERT INTO restaurant_tables (business_id, table_number, status, created_at, updated_at) VALUES ${values} ON CONFLICT (business_id, table_number) DO NOTHING`,
-          [req.user.id, ...toInsert]
+          [businessId, ...toInsert]
         )
       }
       if (totalTables < Math.max(...existingNumbers, 0)) {
-        await client.query('DELETE FROM restaurant_tables WHERE business_id=$1 AND table_number > $2', [req.user.id, totalTables])
+        await client.query('DELETE FROM restaurant_tables WHERE business_id=$1 AND table_number > $2', [businessId, totalTables])
       }
     } else {
-      await client.query('DELETE FROM restaurant_tables WHERE business_id=$1', [req.user.id])
+      await client.query('DELETE FROM restaurant_tables WHERE business_id=$1', [businessId])
     }
     await client.query('COMMIT')
     res.json({ success: true })
@@ -309,16 +417,16 @@ app.post('/api/restaurant/settings', auth, async (req, res) => {
   }
 })
 
-app.get('/api/restaurant/tables', auth, async (req, res) => {
+app.get('/api/restaurant/tables', auth, requirePermission('restaurant.view'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const result = await pool.query(
     'SELECT id, table_number, status, customer_name, expected_time FROM restaurant_tables WHERE business_id=$1 ORDER BY table_number',
-    [req.user.id]
+    [req.user.businessId]
   )
   res.json(result.rows)
 })
 
-app.patch('/api/restaurant/tables/:id', auth, async (req, res) => {
+app.patch('/api/restaurant/tables/:id', auth, requirePermission('restaurant.manage_tables'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const { status, customerName, expectedTime } = req.body
   if (!['vacant', 'occupied', 'reserved'].includes(status)) {
@@ -326,31 +434,31 @@ app.patch('/api/restaurant/tables/:id', auth, async (req, res) => {
   }
   const result = await pool.query(
     'UPDATE restaurant_tables SET status=$1, customer_name=$2, expected_time=$3, updated_at=NOW() WHERE id=$4 AND business_id=$5 RETURNING *',
-    [status, customerName || null, expectedTime || null, req.params.id, req.user.id]
+    [status, customerName || null, expectedTime || null, req.params.id, req.user.businessId]
   )
   if (!result.rows.length) return res.status(404).json({ error: 'Table not found' })
   res.json(result.rows[0])
 })
 
 // Get or create open order for a table
-app.get('/api/restaurant/tables/:tableId/order', auth, async (req, res) => {
+app.get('/api/restaurant/tables/:tableId/order', auth, requirePermission('restaurant.manage_orders'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const tableId = req.params.tableId
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   
   // Get or create open order
   let orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   
   if (!orderResult.rows.length) {
     orderResult = await pool.query(
       'INSERT INTO table_orders (business_id, table_id, status, total_amount) VALUES ($1,$2,\'open\',0) RETURNING *',
-      [req.user.id, tableId]
+      [req.user.businessId, tableId]
     )
   }
   
@@ -370,7 +478,7 @@ app.get('/api/restaurant/tables/:tableId/order', auth, async (req, res) => {
 })
 
 // Add items to table order
-app.post('/api/restaurant/tables/:tableId/order/items', auth, async (req, res) => {
+app.post('/api/restaurant/tables/:tableId/order/items', auth, requirePermission('restaurant.manage_orders'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const tableId = req.params.tableId
   const { items } = req.body // [{ productId, quantity, note }]
@@ -378,19 +486,19 @@ app.post('/api/restaurant/tables/:tableId/order/items', auth, async (req, res) =
   if (!items || !items.length) return res.status(400).json({ error: 'Items required' })
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   
   // Get or create open order
   let orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   
   if (!orderResult.rows.length) {
     orderResult = await pool.query(
       'INSERT INTO table_orders (business_id, table_id, status, total_amount) VALUES ($1,$2,\'open\',0) RETURNING *',
-      [req.user.id, tableId]
+      [req.user.businessId, tableId]
     )
   }
   
@@ -409,7 +517,7 @@ app.post('/api/restaurant/tables/:tableId/order/items', auth, async (req, res) =
       // Verify product belongs to business and get price
       const productResult = await client.query(
         'SELECT id, selling_price FROM products WHERE id=$1 AND business_id=$2',
-        [productId, req.user.id]
+        [productId, req.user.businessId]
       )
       if (!productResult.rows.length) throw Object.assign(new Error('Product not found'), { status: 404 })
       
@@ -453,14 +561,14 @@ app.post('/api/restaurant/tables/:tableId/order/items', auth, async (req, res) =
 })
 
 // Generate KOT (Kitchen Order Ticket)
-app.get('/api/restaurant/tables/:tableId/kot', auth, async (req, res) => {
+app.get('/api/restaurant/tables/:tableId/kot', auth, requirePermission('restaurant.kot'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const tableId = req.params.tableId
   
   // Verify table belongs to business
   const tableResult = await pool.query(
     'SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   if (!tableResult.rows.length) return res.status(404).json({ error: 'Table not found' })
   
@@ -469,7 +577,7 @@ app.get('/api/restaurant/tables/:tableId/kot', auth, async (req, res) => {
   // Get the latest order for this table
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -487,7 +595,7 @@ app.get('/api/restaurant/tables/:tableId/kot', auth, async (req, res) => {
   )
   
   // Get business name
-  const businessResult = await pool.query('SELECT name FROM businesses WHERE id=$1', [req.user.id])
+  const businessResult = await pool.query('SELECT name FROM businesses WHERE id=$1', [req.user.businessId])
   
   res.json({
     tableNumber: table.table_number,
@@ -501,18 +609,18 @@ app.get('/api/restaurant/tables/:tableId/kot', auth, async (req, res) => {
 })
 
 // Mark order as sent to kitchen
-app.post('/api/restaurant/tables/:tableId/order/send-to-kitchen', auth, async (req, res) => {
+app.post('/api/restaurant/tables/:tableId/order/send-to-kitchen', auth, requirePermission('restaurant.manage_orders'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const tableId = req.params.tableId
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   
   // Get the latest order
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -533,20 +641,20 @@ app.post('/api/restaurant/tables/:tableId/order/send-to-kitchen', auth, async (r
 })
 
 // Generate bill from table order - creates invoice
-app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req, res) => {
+app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, requirePermission('invoices.create'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const tableId = req.params.tableId
   const { customerId, paid = 0 } = req.body
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   const table = tableCheck.rows[0]
   
   // Get the latest order
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -573,15 +681,16 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req
     const total = Number(order.total_amount)
     const paymentAmount = Number(paid) || 0
     const due = Math.max(total - paymentAmount, 0)
-    const udharEnabledTypes = ['retail', 'wholesaler', 'school', 'other']
-    const businessCategory = req.user.category || 'other'
-    const hasUdhar = udharEnabledTypes.includes(businessCategory)
+    // Check if Udhar module is enabled for this business
+    const businessResult = await client.query('SELECT enabled_modules FROM businesses WHERE id=$1', [req.user.businessId])
+    const enabledModules = businessResult.rows[0]?.enabled_modules || []
+    const hasUdhar = Array.isArray(enabledModules) && enabledModules.includes('udhar')
     const status = paymentAmount >= total ? 'paid' : paymentAmount > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid')
     
     // Create invoice
     const invoiceResult = await client.query(
       'INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [req.user.id, customerId || null, total, paymentAmount, status]
+      [req.user.businessId, customerId || null, total, paymentAmount, status]
     )
     const invoice = invoiceResult.rows[0]
     
@@ -596,7 +705,7 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req
     
     // Update customer balance if there's due amount
     if (customerId && due > 0) {
-      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.id])
+      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.businessId])
       await client.query("INSERT INTO udhar_ledger (customer_id, invoice_id, type, amount, note) VALUES ($1,$2,'credit',$3,'Invoice credit')", [customerId, invoice.id, due])
     }
     
@@ -628,19 +737,19 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, async (req
 })
 
 // Get bill preview for table order (without creating invoice)
-app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, async (req, res) => {
+app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, requirePermission('invoices.read'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const tableId = req.params.tableId
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.id])
+  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   const table = tableCheck.rows[0]
   
   // Get the latest order
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.id]
+    [tableId, req.user.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -677,7 +786,7 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, async (req, 
   const grandTotal = subtotal + totalGst
 
   // Get business name
-  const businessResult = await pool.query('SELECT name, address FROM businesses WHERE id=$1', [req.user.id])
+  const businessResult = await pool.query('SELECT name, address FROM businesses WHERE id=$1', [req.user.businessId])
 
   res.json({
     tableNumber: table.table_number,
@@ -693,16 +802,16 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, async (req, 
   })
 })
 
-app.post('/api/payments', auth, async (req, res) => {
+app.post('/api/payments', auth, requirePermission('payments.create'), async (req, res) => {
   const { customerId, amount, note = 'Payment received' } = req.body
   if (!customerId || !amount || Number(amount) <= 0) return res.status(400).json({ error: 'Customer and positive payment amount are required' })
-  const result = await pool.query('UPDATE customers SET balance=GREATEST(balance-$1,0) WHERE id=$2 AND business_id=$3 RETURNING *', [amount, customerId, req.user.id])
+  const result = await pool.query('UPDATE customers SET balance=GREATEST(balance-$1,0) WHERE id=$2 AND business_id=$3 RETURNING *', [amount, customerId, req.user.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Customer not found' })
   await pool.query("INSERT INTO udhar_ledger (customer_id, type, amount, note) VALUES ($1,'payment',$2,$3)", [customerId, amount, note])
   res.status(201).json(result.rows[0])
 })
 
-app.post('/api/invoices/:id/pdf', auth, async (req, res) => {
+app.post('/api/invoices/:id/pdf', auth, requirePermission('invoices.export'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const invoiceId = req.params.id
   
@@ -714,7 +823,7 @@ app.post('/api/invoices/:id/pdf', auth, async (req, res) => {
      JOIN businesses b ON b.id = i.business_id
      LEFT JOIN customers c ON c.id = i.customer_id
      WHERE i.id = $1 AND i.business_id = $2`,
-    [invoiceId, req.user.id]
+    [invoiceId, req.user.businessId]
   )
   
   if (!invoiceResult.rows.length) return res.status(404).json({ error: 'Invoice not found' })
@@ -783,9 +892,9 @@ app.post('/api/invoices/:id/pdf', auth, async (req, res) => {
   doc.text('Sr', tableLeft + 5, y + 5, { width: colWidths.sr })
   doc.text('Description', tableLeft + colWidths.sr + 5, y + 5, { width: colWidths.name })
   doc.text('Qty', tableLeft + colWidths.sr + colWidths.name + 5, y + 5, { width: colWidths.qty, align: 'center' })
-  doc.text('Unit', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + 5, y + 5, { width: colWidths.unit, align: 'center' })
-  doc.text('Price', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + 5, y + 5, { width: colWidths.price, align: 'right' })
-  doc.text('Disc %', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + 5, y + 5, { width: colWidths.disc, align: 'center' })
+  doc.text('Unit', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + 5, y + 5, { width: colWidths.unit, align: 'center' })
+  doc.text('Price', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + 5, y + 5, { width: colWidths.price, align: 'right' })
+  doc.text('Disc %', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + colWidths.disc + 5, y + 5, { width: colWidths.disc, align: 'center' })
   doc.text('GST %', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + colWidths.disc + 5, y + 5, { width: colWidths.gst, align: 'center' })
   doc.text('Amount', tableLeft + 520 - colWidths.amount, y + 5, { width: colWidths.amount, align: 'right' })
   doc.fillColor('#000000')
@@ -825,9 +934,9 @@ app.post('/api/invoices/:id/pdf', auth, async (req, res) => {
     doc.text(String(index + 1), tableLeft + 5, y + 5, { width: colWidths.sr })
     doc.text(item.name, tableLeft + colWidths.sr + 5, y + 5, { width: colWidths.name })
     doc.text(String(qty), tableLeft + colWidths.sr + colWidths.name + 5, y + 5, { width: colWidths.qty, align: 'center' })
-    doc.text(item.unit || 'pcs', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + 5, y + 5, { width: colWidths.unit, align: 'center' })
-    doc.text(`₹${price.toFixed(2)}`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + 5, y + 5, { width: colWidths.price, align: 'right' })
-    doc.text(`${discountPercent}%`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + 5, y + 5, { width: colWidths.disc, align: 'center' })
+    doc.text(item.unit || 'pcs', tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + 5, y + 5, { width: colWidths.unit, align: 'center' })
+    doc.text(`₹${price.toFixed(2)}`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + 5, y + 5, { width: colWidths.price, align: 'right' })
+    doc.text(`${discountPercent}%`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + colWidths.disc + 5, y + 5, { width: colWidths.disc, align: 'center' })
     doc.text(`${gstPercent}%`, tableLeft + colWidths.sr + colWidths.name + colWidths.qty + colWidths.unit + colWidths.price + colWidths.disc + 5, y + 5, { width: colWidths.gst, align: 'center' })
     doc.text(`₹${rowTotal.toFixed(2)}`, tableLeft + 520 - colWidths.amount, y + 5, { width: colWidths.amount, align: 'right' })
     y += rowHeight
@@ -869,17 +978,108 @@ app.post('/api/invoices/:id/pdf', auth, async (req, res) => {
   doc.fontSize(9).font('Helvetica-Oblique').text('Thank you for your business!', { align: 'center' })
   doc.text('Generated by Bilkaro', { align: 'center' })
   
-  doc.end()
+doc.end()
 })
 
-app.post('/api/business/update-type', auth, async (req, res) => {
+// Team API endpoints
+app.get('/api/team', auth, requirePermission('settings.team'), async (req, res) => {
+  const result = await pool.query('SELECT id, name, email, role, created_at FROM team_members WHERE business_id = $1 ORDER BY created_at', [req.user.businessId])
+  res.json(result.rows)
+})
+
+app.post('/api/team/invite', auth, requirePermission('users.invite'), async (req, res) => {
+  const { name, email, password, role } = req.body
+  if (!name || !email || !password || !role) {
+    return res.status(400).json({ error: 'Name, email, password, and role are required' })
+  }
+  const validRoles = ['owner', 'manager', 'staff']
+  if (!validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' })
+  }
+  // Only owner can create other owners
+  if (role === 'owner' && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owners can create other owners' })
+  }
+  const existing = await pool.query('SELECT id FROM team_members WHERE business_id = $1 AND email = $2', [req.user.businessId, email])
+  if (existing.rows.length > 0) {
+    return res.status(400).json({ error: 'Team member with this email already exists' })
+  }
+  const passwordHash = await bcrypt.hash(password, 12)
+  const result = await pool.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role, created_at', [req.user.businessId, name, email, passwordHash, role])
+  res.status(201).json(result.rows[0])
+})
+
+app.delete('/api/team/:id', auth, requirePermission('users.remove'), async (req, res) => {
+  const memberId = req.params.id
+  // Prevent self-removal
+  if (req.user.teamMemberId && Number(memberId) === req.user.teamMemberId) {
+    return res.status(400).json({ error: 'Cannot remove yourself' })
+  }
+  const member = await pool.query('SELECT role FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.user.businessId])
+  if (!member.rows.length) {
+    return res.status(404).json({ error: 'Team member not found' })
+  }
+  // Only owner can remove other owners
+  if (member.rows[0].role === 'owner' && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owners can remove other owners' })
+  }
+  await pool.query('DELETE FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.user.businessId])
+  res.status(204).end()
+})
+
+app.patch('/api/team/:id/role', auth, requirePermission('users.manage_roles'), async (req, res) => {
+  const { role } = req.body
+  const memberId = req.params.id
+  const validRoles = ['owner', 'manager', 'staff']
+  if (!validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' })
+  }
+  // Only owner can assign owner role
+  if (role === 'owner' && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owners can assign owner role' })
+  }
+  const member = await pool.query('SELECT role FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.user.businessId])
+  if (!member.rows.length) {
+    return res.status(404).json({ error: 'Team member not found' })
+  }
+  // Only owner can change another owner's role
+  if (member.rows[0].role === 'owner' && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owners can change owner role' })
+  }
+  const result = await pool.query('UPDATE team_members SET role = $1 WHERE id = $2 AND business_id = $3 RETURNING id, name, email, role, created_at', [role, memberId, req.user.businessId])
+  res.json(result.rows[0])
+})
+
+app.post('/api/business/update-type', auth, requirePermission('settings.business_type'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const { category } = req.body
   const validCategories = ['retail', 'wholesaler', 'restaurant', 'school', 'services', 'other']
   if (!validCategories.includes(category)) {
     return res.status(400).json({ error: 'Invalid business type' })
   }
-  const result = await pool.query('UPDATE businesses SET category=$1 WHERE id=$2 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address', [category, req.user.id])
+  // Get default modules for new business type
+  const defaultModulesMap = {
+    retail: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
+    wholesaler: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
+    restaurant: ["dashboard", "tables", "menu", "kot", "invoices", "expenses", "analytics", "reports", "team"],
+    school: ["dashboard", "customers", "udhar", "expenses", "analytics", "reports", "team"],
+    services: ["dashboard", "customers", "invoices", "expenses", "analytics", "reports", "team"],
+    other: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "tables", "menu", "kot", "team"]
+  }
+  const defaultModules = defaultModulesMap[category] || defaultModulesMap.other
+  const result = await pool.query('UPDATE businesses SET category=$1, enabled_modules=$2 WHERE id=$3 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [category, JSON.stringify(defaultModules), req.user.businessId])
+  if (!result.rows.length) return res.status(404).json({ error: 'Business not found' })
+  const user = result.rows[0]
+  res.json({ user: toBusiness(user) })
+})
+
+app.post('/api/business/update-modules', auth, requirePermission('settings.modules'), async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const { enabledModules } = req.body
+  if (!Array.isArray(enabledModules)) {
+    return res.status(400).json({ error: 'enabledModules must be an array' })
+  }
+  const result = await pool.query('UPDATE businesses SET enabled_modules=$1 WHERE id=$2 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [JSON.stringify(enabledModules), req.user.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Business not found' })
   const user = result.rows[0]
   res.json({ user: toBusiness(user) })

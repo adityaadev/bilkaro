@@ -21,13 +21,21 @@ import {
   Wallet,
   X,
   Zap,
+  UserPlus,
+  UserMinus,
+  UserCheck,
+  Shield,
+  Key,
+  Mail,
+  Lock,
+  Clipboard,
 } from "lucide-react";
 import "./App.css";
 import "./mobile.css";
 import "./desktop.css";
 import ExpensesView from "./ExpensesView";
 
-const API_BASE = "http://localhost:4000/api";
+const API_BASE = "/api";
 export const api = axios.create({ baseURL: API_BASE });
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("bilkaro_token");
@@ -35,6 +43,13 @@ api.interceptors.request.use((config) => {
     config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
+function clearAuthAndRedirect() {
+  localStorage.removeItem("bilkaro_token");
+  localStorage.removeItem("bilkaro_user");
+  localStorage.removeItem("bilkaro_enabled_modules");
+  window.location.href = "/";
+}
+
 api.interceptors.response.use(
   (response) => response,
   (error) => {
@@ -45,9 +60,26 @@ api.interceptors.response.use(
       response: error.response?.data,
       error,
     });
+    if (error.response?.status === 401 && !error.config?.url?.startsWith("/auth/")) {
+      clearAuthAndRedirect();
+    }
     return Promise.reject(error);
   },
 );
+
+const ROLE_PERMISSIONS = {
+  owner: [
+    'dashboard', 'products', 'customers', 'invoices', 'udhar', 'expenses', 
+    'analytics', 'reports', 'tables', 'menu', 'kot', 'settings', 'team'
+  ],
+  manager: [
+    'dashboard', 'products', 'customers', 'invoices', 'udhar', 'expenses', 
+    'analytics', 'reports', 'tables', 'menu', 'kot', 'settings'
+  ],
+  staff: [
+    'dashboard', 'products', 'customers', 'invoices'
+  ]
+};
 
 const BUSINESS_TYPES = [
   {
@@ -55,42 +87,42 @@ const BUSINESS_TYPES = [
     label: "Retail / General Store",
     description: "Shops, supermarkets, kirana stores, boutiques",
     icon: ShoppingCart,
-    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports"],
+    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
   },
   {
     id: "wholesaler",
     label: "Wholesaler",
     description: "Bulk distributors, wholesale dealers, B2B suppliers",
     icon: Boxes,
-    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports"],
+    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
   },
   {
     id: "restaurant",
     label: "Restaurant / Food",
     description: "Restaurants, cafes, food trucks, catering",
     icon: ShoppingCart,
-    defaultModules: ["dashboard", "tables", "menu", "kot", "invoices", "expenses", "analytics", "reports"],
+    defaultModules: ["dashboard", "tables", "menu", "kot", "invoices", "expenses", "analytics", "reports", "team"],
   },
   {
     id: "school",
     label: "School",
     description: "Schools, coaching centers, tuition classes",
     icon: Users,
-    defaultModules: ["dashboard", "customers", "udhar", "expenses", "analytics", "reports"],
+    defaultModules: ["dashboard", "customers", "udhar", "expenses", "analytics", "reports", "team"],
   },
   {
     id: "services",
     label: "Services (salon, repair, etc.)",
     description: "Salons, repair shops, consultants, freelancers",
     icon: Package,
-    defaultModules: ["dashboard", "customers", "invoices", "expenses", "analytics", "reports"],
+    defaultModules: ["dashboard", "customers", "invoices", "expenses", "analytics", "reports", "team"],
   },
   {
     id: "other",
     label: "Other",
     description: "Any other business type - all modules available",
     icon: CircleHelp,
-    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "tables", "menu", "kot"],
+    defaultModules: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "tables", "menu", "kot", "team"],
   },
 ];
 
@@ -106,6 +138,7 @@ const MODULE_KEYS = [
   { key: "tables", label: "Tables", icon: Table },
   { key: "menu", label: "Menu", icon: FileText },
   { key: "kot", label: "KOT", icon: Bell },
+  { key: "team", label: "Team", icon: Users, ownerOnly: true },
 ];
 
 function getEnabledModules(businessType) {
@@ -116,6 +149,11 @@ function getEnabledModules(businessType) {
 function getModuleKeysForBusiness(businessType, customEnabledModules = []) {
   const enabled = new Set([...getEnabledModules(businessType), ...customEnabledModules]);
   return MODULE_KEYS.filter((m) => enabled.has(m.key) || m.required);
+}
+
+function getModulesForRole(role) {
+  const permitted = ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.staff;
+  return MODULE_KEYS.filter((m) => permitted.includes(m.key) || m.required);
 }
 
 
@@ -147,7 +185,14 @@ function App() {
   const loadRequest = useRef(0);
 
   const businessType = user?.businessType || "other";
-  const currentNav = getModuleKeysForBusiness(businessType, enabledModules).map((m) => [m.label, m.icon]);
+  const userRole = user?.role || "owner";
+  
+  // Combine business type modules with role permissions
+  const businessModules = getEnabledModules(businessType);
+  const roleModules = ROLE_PERMISSIONS[userRole] || ROLE_PERMISSIONS.staff;
+  const allowedModules = new Set([...businessModules, ...enabledModules].filter(m => roleModules.includes(m)));
+  
+  const currentNav = MODULE_KEYS.filter((m) => (allowedModules.has(m.key) || m.required) && (!m.ownerOnly || userRole === 'owner')).map((m) => [m.label, m.icon]);
   const notify = (message) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 3500);
@@ -178,16 +223,22 @@ function App() {
         ]);
       if (requestId !== loadRequest.current) return;
       setDashboard(dashboardResponse.data);
+      const business = dashboardResponse.data.business;
       setUser({
-        ...dashboardResponse.data.business,
+        ...business,
         ownerName:
-          dashboardResponse.data.business.name ||
-          dashboardResponse.data.business.ownerName,
+          business.name ||
+          business.ownerName,
+        role: business.role || 'owner',
       });
       localStorage.setItem(
         "bilkaro_user",
-        JSON.stringify(dashboardResponse.data.business),
+        JSON.stringify(business),
       );
+      if (business.enabledModules) {
+        setEnabledModules(business.enabledModules);
+        localStorage.setItem("bilkaro_enabled_modules", JSON.stringify(business.enabledModules));
+      }
       setProducts(productsResponse.data);
       setCustomers(customersResponse.data);
       setInvoices(invoicesResponse.data);
@@ -245,6 +296,7 @@ function App() {
   const logout = () => {
     localStorage.removeItem("bilkaro_token");
     localStorage.removeItem("bilkaro_user");
+    localStorage.removeItem("bilkaro_enabled_modules");
     setToken(null);
     setUser(null);
     setDashboard(null);
@@ -264,11 +316,10 @@ function App() {
     );
 
   const isModuleEnabled = (moduleKey) => {
-    const enabled = new Set([...getEnabledModules(businessType), ...enabledModules]);
-    return enabled.has(moduleKey);
+    return allowedModules.has(moduleKey);
   };
 
-  if (!isModuleEnabled(active.toLowerCase()) && active !== "Settings") {
+  if (!isModuleEnabled(active.toLowerCase()) && active !== "Settings" && active !== "Team") {
     setActive("Dashboard");
   }
 
@@ -364,7 +415,10 @@ function App() {
         enabledModules={enabledModules}
         setEnabledModules={setEnabledModules}
         setUser={setUser}
+        setActive={setActive}
       />
+    ) : active === "Team" ? (
+      <TeamView user={user} notify={notify} onError={reportError} />
     ) : (
       <DashboardView
         dashboard={dashboard}
@@ -541,6 +595,10 @@ function readStorage(key) {
   } catch {
     return null;
   }
+}
+
+function formatCurrency(value) {
+  return `₹${Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 }
 function PageHeading({ title, subtitle, action, onAction }) {
   return (
@@ -1050,7 +1108,6 @@ function AnalyticsView({ onError, notify }) {
     )
   }
 
-  const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
   const formatNumber = (value) => Number(value || 0).toLocaleString('en-IN')
 
   const sales = analytics?.sales || {}
@@ -1274,11 +1331,11 @@ function SalesChart({ data }) {
   const maxSales = Math.max(...data.map(d => d.sales))
   const height = 260
   const padding = { top: 20, right: 40, bottom: 40, left: 50 }
-  const chartWidth = `calc(100% - ${padding.left + padding.right}px)`
+  const chartWidth = 400
   const chartHeight = height - padding.top - padding.bottom
 
   return (
-    <svg width="100%" height={height} style={{display: 'block'}}>
+    <svg width="100%" height={height} style={{display: 'block'}} viewBox={`0 0 ${chartWidth + padding.left + padding.right} ${height}`}>
       <defs>
         <linearGradient id="salesGradient" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="var(--color-primary)" stopOpacity="0.3" />
@@ -1289,7 +1346,7 @@ function SalesChart({ data }) {
         <rect width={chartWidth} height={chartHeight} fill="url(#salesGradient)" />
         <path
           d={data.map((d, i) => {
-            const x = (i / (data.length - 1 || 1)) * chartWidth
+            const x = (i / Math.max(data.length - 1, 1)) * chartWidth
             const y = chartHeight - (d.sales / (maxSales || 1)) * chartHeight
             return `${i === 0 ? 'M' : 'L'} ${x} ${y}`
           }).join(' ')}
@@ -1300,7 +1357,7 @@ function SalesChart({ data }) {
           strokeLinejoin="round"
         />
         {data.map((d, i) => {
-          const x = (i / (data.length - 1 || 1)) * chartWidth
+          const x = (i / Math.max(data.length - 1, 1)) * chartWidth
           const y = chartHeight - (d.sales / (maxSales || 1)) * chartHeight
           return (
             <circle key={i} cx={x} cy={y} r={4} fill="var(--color-primary)" stroke="var(--color-bg)" strokeWidth={2} />
@@ -1309,7 +1366,7 @@ function SalesChart({ data }) {
       </g>
       <g transform={`translate(${padding.left},${height - padding.bottom})`} style={{fontSize: '10px', fill: 'var(--color-text-muted)'}}>
         {data.map((d, i) => (
-          <text key={i} x={(i / (data.length - 1 || 1)) * chartWidth} y={15} textAnchor="middle" dominantBaseline="hanging">
+          <text key={i} x={(i / Math.max(data.length - 1, 1)) * chartWidth} y={15} textAnchor="middle" dominantBaseline="hanging">
             {new Date(d.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
           </text>
         ))}
@@ -2178,7 +2235,7 @@ function KOTView({ tables, products, onError, notify }) {
   );
 }
 
-function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enabledModules, setEnabledModules, setUser }) {
+function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enabledModules, setEnabledModules, setUser, setActive }) {
   const [totalTables, setTotalTables] = useState(restaurantSettings.totalTables || 0);
   const [saving, setSaving] = useState(false);
   const [moduleSaving, setModuleSaving] = useState(false);
@@ -2186,7 +2243,7 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
   const [typeSaving, setTypeSaving] = useState(false);
 
   const defaultModules = getEnabledModules(businessType);
-  const availableModules = MODULE_KEYS.filter((m) => !m.required);
+  const availableModules = MODULE_KEYS.filter((m) => !m.required && !m.ownerOnly);
 
   const handleSave = async (event) => {
     event.preventDefault();
@@ -2221,6 +2278,7 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
   const handleSaveModules = async () => {
     setModuleSaving(true);
     try {
+      await api.post("/business/update-modules", { enabledModules });
       localStorage.setItem("bilkaro_enabled_modules", JSON.stringify(enabledModules));
       notify("Module preferences saved");
     } catch (error) {
@@ -2345,6 +2403,318 @@ function SettingsView({ restaurantSettings, onSaved, onError, notify, user, enab
           </div>
         )}
       </div>
+      {user?.role === "owner" && (
+        <div className="settings-section" style={{marginTop: 'var(--spacing-xl)'}}>
+          <h3>Team</h3>
+          <p className="settings-description">Manage your team members and their roles. Only business owners can access team management.</p>
+          <button className="btn btn-primary" onClick={() => setActive("Team")} style={{marginTop: 'var(--spacing-md)'}}>
+            <UserPlus size={16} /> Manage Team
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Team page component (owner only)
+function TeamView({ user, notify, onError }) {
+  const [members, setMembers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [inviteForm, setInviteForm] = useState({ name: "", email: "", password: "", role: "staff" });
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [inviteSuccess, setInviteSuccess] = useState(null);
+
+  const fetchMembers = async () => {
+    try {
+      const response = await api.get("/team");
+      setMembers(response.data);
+    } catch (error) {
+      onError("Load team members", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchMembers();
+  }, []);
+
+  const handleInvite = async (e) => {
+    e.preventDefault();
+    if (!inviteForm.name || !inviteForm.email || !inviteForm.password || !inviteForm.role) {
+      notify("All fields are required");
+      return;
+    }
+    setInviteLoading(true);
+    try {
+      const response = await api.post("/team/invite", inviteForm);
+      notify(`${inviteForm.name} invited as ${inviteForm.role}`);
+      setShowInviteModal(false);
+      // Show success modal with login details
+      setInviteSuccess({
+        name: inviteForm.name,
+        email: inviteForm.email,
+        password: inviteForm.password,
+        role: inviteForm.role,
+        loginUrl: window.location.origin
+      });
+      setInviteForm({ name: "", email: "", password: "", role: "staff" });
+      fetchMembers();
+    } catch (error) {
+      onError("Invite team member", error);
+    } finally {
+      setInviteLoading(false);
+    }
+  };
+
+  const handleRemove = async (memberId, memberName) => {
+    if (!window.confirm(`Remove ${memberName} from the team?`)) return;
+    try {
+      await api.delete(`/team/${memberId}`);
+      notify(`${memberName} removed from team`);
+      fetchMembers();
+    } catch (error) {
+      onError("Remove team member", error);
+    }
+  };
+
+  const handleRoleChange = async (memberId, newRole) => {
+    try {
+      await api.patch(`/team/${memberId}/role`, { role: newRole });
+      notify(`Role updated to ${newRole}`);
+      fetchMembers();
+    } catch (error) {
+      onError("Change role", error);
+    }
+  };
+
+  const roleOptions = [
+    { value: "owner", label: "Owner", desc: "Full access including Settings & Team management" },
+    { value: "manager", label: "Manager", desc: "All access except Settings & Team management" },
+    { value: "staff", label: "Staff", desc: "Dashboard, Products (view), Invoices (create), Customers (view) only" },
+  ];
+
+  const getRoleBadge = (role) => {
+    const styles = {
+      owner: "role-badge owner",
+      manager: "role-badge manager",
+      staff: "role-badge staff",
+    };
+    return <span className={styles[role] || "role-badge"}>{role.charAt(0).toUpperCase() + role.slice(1)}</span>;
+  };
+
+  if (user?.role !== "owner") {
+    return (
+      <div className="section-view">
+        <PageHeading title="Team" subtitle="Team management is only available to business owners" />
+        <div className="card">
+          <div className="empty-state">
+            <Shield size={28} />
+            <strong>Access Denied</strong>
+            <span>Only business owners can manage team members.</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="section-view">
+      <PageHeading
+        title="Team"
+        subtitle="Manage your team members and their roles"
+        action="Invite Member"
+        onAction={() => setShowInviteModal(true)}
+      />
+      {loading ? (
+        <div className="loading">Loading team members...</div>
+      ) : (
+        <div className="card">
+          <div className="table-head">
+            <div className="table-head-cell">NAME</div>
+            <div className="table-head-cell">EMAIL</div>
+            <div className="table-head-cell">ROLE</div>
+            <div className="table-head-cell">JOINED</div>
+            <div className="table-head-cell">ACTIONS</div>
+          </div>
+          {members.map((member) => (
+            <div className="table-row" key={member.id}>
+              <div className="table-cell">
+                <div className="table-cell-content">
+                  <div className="list-avatar" style={{width: 36, height: 36, fontSize: 'var(--font-size-sm)'}}>{member.name.charAt(0)}</div>
+                  <div>
+                    <strong>{member.name}</strong>
+                    {member.id === user?.teamMemberId && <span style={{fontSize: 'var(--font-size-xs)', color: 'var(--color-primary)', marginLeft: 'var(--spacing-xs)'}}>(You)</span>}
+                  </div>
+                </div>
+              </div>
+              <div className="table-cell">
+                <span className="table-cell-content">{member.email}</span>
+              </div>
+              <div className="table-cell">
+                <select
+                  value={member.role}
+                  onChange={(e) => handleRoleChange(member.id, e.target.value)}
+                  disabled={member.id === user?.teamMemberId}
+                  className="form-select"
+                  style={{width: 'auto', maxWidth: '160px'}}
+                >
+                  {roleOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="table-cell">
+                <span className="table-cell-content">{new Date(member.created_at).toLocaleDateString()}</span>
+              </div>
+              <div className="table-cell table-cell-action">
+                {member.id !== user?.teamMemberId && (
+                  <button
+                    className="btn btn-danger btn-sm"
+                    onClick={() => handleRemove(member.id, member.name)}
+                  >
+                    <UserMinus size={14} /> Remove
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+          {!members.length && (
+            <div className="empty-state">
+              <Users size={28} />
+              <strong>No team members yet</strong>
+              <span>Invite your first team member to get started.</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {showInviteModal && (
+        <Modal title="Invite Team Member" onClose={() => { setShowInviteModal(false); setInviteForm({ name: "", email: "", password: "", role: "staff" }); }}>
+          <form onSubmit={handleInvite}>
+            <div className="form-group">
+              <label className="form-label">Name</label>
+              <input
+                type="text"
+                className="form-input"
+                value={inviteForm.name}
+                onChange={(e) => setInviteForm({ ...inviteForm, name: e.target.value })}
+                required
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Email</label>
+              <input
+                type="email"
+                className="form-input"
+                value={inviteForm.email}
+                onChange={(e) => setInviteForm({ ...inviteForm, email: e.target.value })}
+                required
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Temporary Password</label>
+              <input
+                type="password"
+                className="form-input"
+                value={inviteForm.password}
+                onChange={(e) => setInviteForm({ ...inviteForm, password: e.target.value })}
+                required
+                minLength={6}
+              />
+              <small style={{color: 'var(--color-text-muted)'}}>Minimum 6 characters. Share this securely with the team member.</small>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Role</label>
+              <select
+                className="form-select"
+                value={inviteForm.role}
+                onChange={(e) => setInviteForm({ ...inviteForm, role: e.target.value })}
+                required
+              >
+                {roleOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label} — {opt.desc}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{display: 'flex', gap: 'var(--spacing-md)', marginTop: 'var(--spacing-lg)'}}>
+              <button type="button" className="btn btn-secondary btn-full" onClick={() => { setShowInviteModal(false); setInviteForm({ name: "", email: "", password: "", role: "staff" }); }} style={{flex: 1}}>
+                Cancel
+              </button>
+              <button type="submit" className="btn btn-primary btn-full" disabled={inviteLoading} style={{flex: 1}}>
+                {inviteLoading ? "Inviting..." : "Invite Member"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {inviteSuccess && (
+        <Modal title="Member Invited Successfully" onClose={() => setInviteSuccess(null)} className="invite-success-modal">
+          <div className="invite-success-content">
+            <div className="success-icon">
+              <UserCheck size={48} />
+            </div>
+            <h3>{inviteSuccess.name} has been added as {inviteSuccess.role}</h3>
+            <p style={{color: 'var(--color-text-secondary)', marginBottom: 'var(--spacing-lg)'}}>
+              Share these login details securely with the team member:
+            </p>
+            
+            <div className="login-details-card" style={{background: 'var(--color-surface)', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)', padding: 'var(--spacing-lg)', marginBottom: 'var(--spacing-lg)'}}>
+              <div className="detail-row" style={{display: 'flex', justifyContent: 'space-between', padding: 'var(--spacing-sm) 0', borderBottom: '1px solid var(--color-border)'}}>
+                <span style={{color: 'var(--color-text-secondary)'}}>Login URL</span>
+                <code style={{background: 'var(--color-bg)', padding: 'var(--spacing-xs) var(--spacing-sm)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--font-size-sm)'}}>{inviteSuccess.loginUrl}</code>
+              </div>
+              <div className="detail-row" style={{display: 'flex', justifyContent: 'space-between', padding: 'var(--spacing-sm) 0', borderBottom: '1px solid var(--color-border)'}}>
+                <span style={{color: 'var(--color-text-secondary)'}}>Email</span>
+                <code style={{background: 'var(--color-bg)', padding: 'var(--spacing-xs) var(--spacing-sm)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--font-size-sm)'}}>{inviteSuccess.email}</code>
+              </div>
+              <div className="detail-row" style={{display: 'flex', justifyContent: 'space-between', padding: 'var(--spacing-sm) 0', borderBottom: '1px solid var(--color-border)'}}>
+                <span style={{color: 'var(--color-text-secondary)'}}>Temporary Password</span>
+                <code style={{background: 'var(--color-bg)', padding: 'var(--spacing-xs) var(--spacing-sm)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--font-size-sm)'}}>{inviteSuccess.password}</code>
+              </div>
+              <div className="detail-row" style={{display: 'flex', justifyContent: 'space-between', padding: 'var(--spacing-sm) 0'}}>
+                <span style={{color: 'var(--color-text-secondary)'}}>Role</span>
+                <span style={{fontWeight: 500, textTransform: 'capitalize'}}>{inviteSuccess.role}</span>
+              </div>
+            </div>
+
+            <div className="success-actions" style={{display: 'flex', gap: 'var(--spacing-md)', flexWrap: 'wrap'}}>
+              <button 
+                className="btn btn-primary btn-full" 
+                onClick={() => {
+                  const details = `Bilkaro Login Details:
+Login URL: ${inviteSuccess.loginUrl}
+Email: ${inviteSuccess.email}
+Temporary Password: ${inviteSuccess.password}
+Role: ${inviteSuccess.role}
+
+Please log in and change your password immediately.`;
+                  navigator.clipboard.writeText(details);
+                  notify("Login details copied to clipboard!");
+                }}
+                style={{flex: 1, minWidth: '200px'}}
+              >
+                <Clipboard size={16} style={{marginRight: 'var(--spacing-xs)'}} />
+                Copy Login Details
+              </button>
+              <button 
+                className="btn btn-secondary btn-full" 
+                onClick={() => setInviteSuccess(null)}
+                style={{flex: 1, minWidth: '200px'}}
+              >
+                Done
+              </button>
+            </div>
+
+            <div className="security-note" style={{marginTop: 'var(--spacing-lg)', padding: 'var(--spacing-md)', background: 'var(--color-warning-bg)', border: '1px solid var(--color-warning-border)', borderRadius: 'var(--radius-md)', color: 'var(--color-warning-text)', fontSize: 'var(--font-size-sm)'}}>
+              <strong>Security Note:</strong> The team member must change their password on first login. 
+              Share these details via a secure channel (not email/chat). Consider using a password manager.
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -2526,16 +2896,26 @@ function CustomerModal({ onClose, onSaved, onError }) {
 }
 function InvoiceModal({ products, customers, onClose, onSaved, onError, user, notify }) {
   const [customerId, setCustomerId] = useState("")
-  const [items, setItems] = useState([{ productId: products[0]?.id || "", quantity: 1, gstPercent: 0, discountPercent: 0 }])
+  const [items, setItems] = useState([{ productId: products[0]?.id || "", quantity: 1, gstPercent: 18, discountPercent: 0 }])
   const [paid, setPaid] = useState(0)
   const [gstEnabled, setGstEnabled] = useState(true)
   const [generatingPdf, setGeneratingPdf] = useState(false)
   const [invoiceId, setInvoiceId] = useState(null)
+  const [activeCategory, setActiveCategory] = useState(() => {
+    const cats = [...new Set(products.map(p => p.category || "Uncategorized"))].sort()
+    return cats[0] || ""
+  })
 
   const getProduct = (productId) => products.find((p) => String(p.id) === String(productId))
 
-  const addItem = () => {
-    setItems([...items, { productId: products[0]?.id || "", quantity: 1, gstPercent: gstEnabled ? 18 : 0, discountPercent: 0 }])
+  const addItem = (productId = null) => {
+    const newItem = {
+      productId: productId || products[0]?.id || "",
+      quantity: 1,
+      gstPercent: gstEnabled ? 18 : 0,
+      discountPercent: 0
+    }
+    setItems([...items, newItem])
   }
 
   const removeItem = (index) => {
@@ -2547,10 +2927,21 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
     setItems(items.map((item, i) => (i === index ? { ...item, [field]: value } : item)))
   }
 
+  const handleGstToggle = (enabled) => {
+    setGstEnabled(enabled)
+    if (!enabled) {
+      setItems(items.map(item => ({ ...item, gstPercent: 0 })))
+    }
+  }
+
+  const GST_SLABS = [0, 5, 12, 18, 28]
+
   const calculateTotals = () => {
     let subtotal = 0
     let totalGst = 0
     let totalDiscount = 0
+    let totalCgst = 0
+    let totalSgst = 0
     items.forEach((item) => {
       const product = getProduct(item.productId)
       if (!product) return
@@ -2562,17 +2953,19 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
       const discountAmount = (itemTotal * discountPercent) / 100
       const taxableAmount = itemTotal - discountAmount
       const gstAmount = (taxableAmount * gstPercent) / 100
+      const cgst = gstAmount / 2
+      const sgst = gstAmount / 2
       subtotal += itemTotal
       totalDiscount += discountAmount
       totalGst += gstAmount
+      totalCgst += cgst
+      totalSgst += sgst
     })
-    const cgst = totalGst / 2
-    const sgst = totalGst / 2
     const grandTotal = subtotal - totalDiscount + totalGst
-    return { subtotal, totalDiscount, totalGst, cgst, sgst, grandTotal }
+    return { subtotal, totalDiscount, totalGst, totalCgst, totalSgst, grandTotal }
   }
 
-  const { subtotal, totalDiscount, totalGst, cgst, sgst, grandTotal } = calculateTotals()
+  const { subtotal, totalDiscount, totalGst, totalCgst, totalSgst, grandTotal } = calculateTotals()
 
   const submit = async (event) => {
     event.preventDefault()
@@ -2635,6 +3028,14 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
     }
   }
 
+  const groupedProducts = {}
+  products.forEach(p => {
+    const cat = p.category || "Uncategorized"
+    if (!groupedProducts[cat]) groupedProducts[cat] = []
+    groupedProducts[cat].push(p)
+  })
+  const categories = Object.keys(groupedProducts).sort()
+
   const footer = (
     <div style={{display: 'flex', gap: 'var(--spacing-md)', flexWrap: 'wrap', width: '100%'}}>
       <button className="btn btn-primary btn-full" onClick={() => {
@@ -2678,23 +3079,26 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
 
         <div className="form-group">
           <label className="form-label" style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
-            GST Enabled
+            <span>GST Invoice</span>
             <input
               type="checkbox"
               checked={gstEnabled}
-              onChange={(e) => {
-                const enabled = e.target.checked
-                setGstEnabled(enabled)
-                if (!enabled) {
-                  setItems(items.map(item => ({ ...item, gstPercent: 0 })))
-                }
-              }}
+              onChange={(e) => handleGstToggle(e.target.checked)}
               style={{width: 'auto', marginLeft: 'var(--spacing-sm)'}}
             />
           </label>
         </div>
 
-        <div className="invoice-items">
+        <div className="invoice-items" style={{maxHeight: '50vh', overflow: 'auto'}}>
+          <div className="invoice-header" style={{display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 1fr auto', gap: 'var(--spacing-sm)', padding: 'var(--spacing-sm)', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--color-text-secondary)', textTransform: 'uppercase', borderBottom: '2px solid var(--color-border)', marginBottom: 'var(--spacing-sm)'}}>
+            <div>Product</div>
+            <div style={{textAlign: 'center'}}>Qty</div>
+            <div style={{textAlign: 'right'}}>Price</div>
+            <div style={{textAlign: 'center'}}>Disc %</div>
+            {gstEnabled && <div style={{textAlign: 'center'}}>GST %</div>}
+            <div style={{textAlign: 'right'}}>Total</div>
+            <div></div>
+          </div>
           {items.map((item, index) => {
             const product = getProduct(item.productId)
             const price = Number(product?.selling_price || 0)
@@ -2709,7 +3113,6 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
             return (
               <div key={index} className="invoice-item-row" style={{display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 1fr auto', gap: 'var(--spacing-sm)', alignItems: 'end', padding: 'var(--spacing-sm)', background: 'var(--color-surface)', borderRadius: 'var(--radius-sm)', marginBottom: 'var(--spacing-sm)'}}>
                 <div>
-                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Product</label>
                   <select
                     className="form-select"
                     value={item.productId}
@@ -2722,75 +3125,104 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
                   </select>
                 </div>
                 <div>
-                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Qty</label>
                   <input
                     type="number"
                     className="form-input"
                     value={item.quantity}
-                    onChange={(e) => updateItem(index, 'quantity', Number(e.target.value) || 1)}
+                    onChange={(e) => updateItem(index, 'quantity', Math.max(1, Number(e.target.value) || 1))}
                     min="1"
-                    style={{fontSize: 'var(--font-size-sm)'}}
+                    max="999"
+                    style={{fontSize: 'var(--font-size-sm)', textAlign: 'center'}}
                   />
                 </div>
                 <div>
-                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Price</label>
                   <input
                     type="number"
                     className="form-input"
                     value={price.toFixed(2)}
                     readOnly
-                    style={{fontSize: 'var(--font-size-sm)', background: 'var(--color-bg)'}}
+                    style={{fontSize: 'var(--font-size-sm)', background: 'var(--color-bg)', textAlign: 'right'}}
                   />
                 </div>
                 <div>
-                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Disc %</label>
                   <input
                     type="number"
                     className="form-input"
                     value={item.discountPercent}
-                    onChange={(e) => updateItem(index, 'discountPercent', Number(e.target.value) || 0)}
+                    onChange={(e) => updateItem(index, 'discountPercent', Math.min(100, Math.max(0, Number(e.target.value) || 0)))}
                     min="0"
                     max="100"
                     step="0.5"
-                    style={{fontSize: 'var(--font-size-sm)'}}
+                    style={{fontSize: 'var(--font-size-sm)', textAlign: 'center'}}
                   />
                 </div>
                 {gstEnabled && (
                   <div>
-                    <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>GST %</label>
-                    <input
-                      type="number"
-                      className="form-input"
+                    <select
+                      className="form-select"
                       value={item.gstPercent}
                       onChange={(e) => updateItem(index, 'gstPercent', Number(e.target.value) || 0)}
-                      min="0"
-                      max="100"
-                      step="0.5"
-                      style={{fontSize: 'var(--font-size-sm)'}}
-                    />
+                      style={{fontSize: 'var(--font-size-sm)', textAlign: 'center'}}
+                    >
+                      {GST_SLABS.map(slab => (
+                        <option key={slab} value={slab}>{slab}%</option>
+                      ))}
+                    </select>
                   </div>
                 )}
                 <div style={{textAlign: 'right'}}>
-                  <label className="form-label" style={{fontSize: 'var(--font-size-xs)'}}>Total</label>
                   <div style={{fontSize: 'var(--font-size-base)', fontWeight: 600, color: 'var(--color-primary)'}}>₹{rowTotal.toFixed(2)}</div>
+                  {gstEnabled && gstPercent > 0 && (
+                    <div style={{fontSize: 'var(--font-size-xs)', color: 'var(--color-text-secondary)'}}>
+                      CGST: ₹{(gstAmount/2).toFixed(2)} · SGST: ₹{(gstAmount/2).toFixed(2)}
+                    </div>
+                  )}
                 </div>
-                {items.length > 1 && (
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => removeItem(index)}
-                    style={{height: 'fit-content', marginBottom: 'var(--spacing-xs)'}}
-                    aria-label="Remove item"
-                  >
-                    <X size={16} />
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => removeItem(index)}
+                  style={{height: 'fit-content', marginBottom: 'var(--spacing-xs)'}}
+                  aria-label="Remove item"
+                  disabled={items.length <= 1}
+                >
+                  <X size={16} />
+                </button>
               </div>
             )
           })}
-          <button type="button" className="btn btn-secondary" onClick={addItem} style={{width: 'fit-content', marginTop: 'var(--spacing-sm)'}}>
-            <Plus size={16} /> Add item
+        </div>
+
+        <div style={{display: 'flex', gap: 'var(--spacing-md)', marginTop: 'var(--spacing-md)', flexWrap: 'wrap'}}>
+          <button type="button" className="btn btn-secondary" onClick={() => addItem()}>
+            <Plus size={16} /> Add Item
           </button>
+          {categories.length > 1 && (
+            <div style={{display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)'}}>
+              <label className="form-label" style={{fontSize: 'var(--font-size-sm)', marginBottom: 0}}>Quick Add by Category:</label>
+              <select
+                className="form-select"
+                value={activeCategory}
+                onChange={(e) => setActiveCategory(e.target.value)}
+                style={{width: 'auto', fontSize: 'var(--font-size-sm)'}}
+              >
+                {categories.map(cat => (
+                  <option key={cat} value={cat}>{cat}</option>
+                ))}
+              </select>
+              {(groupedProducts[activeCategory] || []).map(product => (
+                <button
+                  key={product.id}
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => addItem(product.id)}
+                  style={{fontSize: 'var(--font-size-xs)', padding: 'var(--spacing-xs) var(--spacing-sm)'}}
+                >
+                  {product.name} (₹{product.selling_price})
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="invoice-totals" style={{marginTop: 'var(--spacing-lg)', padding: 'var(--spacing-md)', background: 'var(--color-surface)', borderRadius: 'var(--radius-md)'}}>
@@ -2808,11 +3240,11 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
             <>
               <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-xs)', color: 'var(--color-text-secondary)', fontSize: 'var(--font-size-sm)'}}>
                 <span>CGST</span>
-                <span>₹{cgst.toFixed(2)}</span>
+                <span>₹{totalCgst.toFixed(2)}</span>
               </div>
               <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-xs)', color: 'var(--color-text-secondary)', fontSize: 'var(--font-size-sm)'}}>
                 <span>SGST</span>
-                <span>₹{sgst.toFixed(2)}</span>
+                <span>₹{totalSgst.toFixed(2)}</span>
               </div>
               <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--spacing-sm)', fontWeight: 500}}>
                 <span>Total GST</span>

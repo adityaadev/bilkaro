@@ -1989,6 +1989,34 @@ input, select, textarea {
   color: var(--color-success);
 }
 
+/* Role Badges */
+.role-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: capitalize;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+.role-badge.owner {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.role-badge.manager {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.role-badge.staff {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
 /* ==========================================================================
    Toast / Notifications
    ========================================================================== */
