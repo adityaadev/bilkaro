@@ -1,98 +1,107 @@
-import 'dotenv/config'
-import dotenv from 'dotenv'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
 import bcrypt from 'bcryptjs'
-import jwt from 'jsonwebtoken'
-import pg from 'pg'
+import { auth, requirePermission, requireRole, requireBusinessOwnership, generateAccessToken, generateRefreshToken, verifyRefreshToken, getPermissionsForRole } from './middleware/auth.js'
+import { pool, getDatabaseStatus } from './db.js'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-dotenv.config({
-  path: [
-    path.resolve(__dirname, '.env'),
-    path.resolve(__dirname, '.env.local'),
-    path.resolve(__dirname, '..', '.env.local'),
-  ],
-  override: true,
-})
-
-const { Pool } = pg
 const app = express()
 const port = process.env.PORT || 4000
-const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false }) : null
-const allowedOrigins = new Set(['http://localhost:5173', 'http://localhost:5174'])
-app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
+const allowedOrigins = new Set(['http://localhost:5173', 'http://localhost:5174', 'http://127.0.0.1:5173', 'http://127.0.0.1:5174'])
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)), credentials: false }))
 app.use(express.json())
 
-const JWT_SECRET = process.env.JWT_SECRET || 'bilkaro-local-secret'
-const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d'
-
-const toBusiness = (business) => business && ({ id: business.id, name: business.name, ownerName: business.owner_name, email: business.email, phone: business.phone, category: business.category, businessType: business.category, businessDescription: business.business_description, isExisting: business.is_existing, yearsRunning: business.years_running, address: business.address, enabledModules: business.enabled_modules || [] })
-
-const tokenFor = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRY })
-
-const auth = (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '')
-  if (!token) return res.status(401).json({ error: 'Authentication required' })
-  try { 
-    req.user = jwt.verify(token, JWT_SECRET)
-    next() 
-  } catch { res.status(401).json({ error: 'Invalid or expired token' }) }
-}
-
-const requireRole = (...roles) => (req, res, next) => {
-  if (!req.user?.role || !roles.includes(req.user.role)) {
-    return res.status(403).json({ error: `Access denied. Required role: ${roles.join(' or ')}` })
+const normalizeEnabledModules = (value) => {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
   }
-  next()
+  return []
 }
 
-const requirePermission = (permission) => (req, res, next) => {
-  const userRole = req.user?.role
-  const permissions = ROLE_PERMISSIONS[userRole] || []
-  if (!permissions.includes(permission)) {
-    return res.status(403).json({ error: `Permission required: ${permission}` })
+const roundCurrency = (value) => Number(Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100)
+
+const calculateInvoiceItemTotals = (item = {}) => {
+  const quantity = Math.max(Number(item.quantity ?? 1), 0)
+  const unitPrice = Math.max(Number(item.price ?? item.sellingPrice ?? 0), 0)
+  const discountPercent = Math.max(Number(item.discountPercent ?? item.discount_percent ?? 0), 0)
+  const gstPercent = Math.max(Number(item.gstPercent ?? item.gst_percent ?? 0), 0)
+  const baseAmount = roundCurrency(quantity * unitPrice)
+  const discountAmount = roundCurrency(baseAmount * (discountPercent / 100))
+  const taxableAmount = roundCurrency(baseAmount - discountAmount)
+  const gstAmount = roundCurrency(taxableAmount * (gstPercent / 100))
+  const totalLine = roundCurrency(taxableAmount + gstAmount)
+
+  return {
+    quantity,
+    unitPrice,
+    discountPercent,
+    gstPercent,
+    baseAmount,
+    discountAmount,
+    taxableAmount,
+    gstAmount,
+    totalLine,
   }
-  next()
 }
 
-const ROLE_PERMISSIONS = {
-  owner: [
-    'dashboard.view', 'products.read', 'products.create', 'products.update', 'products.delete',
-    'customers.read', 'customers.create', 'customers.update', 'customers.delete',
-    'invoices.read', 'invoices.create', 'invoices.update', 'invoices.delete', 'invoices.export',
-    'expenses.read', 'expenses.create', 'expenses.update', 'expenses.delete',
-    'analytics.view', 'analytics.export',
-    'reports.view', 'reports.export',
-    'payments.create', 'payments.read',
-    'restaurant.view', 'restaurant.manage_tables', 'restaurant.manage_orders', 'restaurant.kot',
-    'settings.business_type', 'settings.restaurant', 'settings.modules', 'settings.team',
-    'users.invite', 'users.manage_roles', 'users.remove'
-  ],
-  manager: [
-    'dashboard.view', 'products.read', 'products.create', 'products.update', 'products.delete',
-    'customers.read', 'customers.create', 'customers.update', 'customers.delete',
-    'invoices.read', 'invoices.create', 'invoices.update', 'invoices.delete', 'invoices.export',
-    'expenses.read', 'expenses.create', 'expenses.update', 'expenses.delete',
-    'analytics.view', 'analytics.export',
-    'reports.view', 'reports.export',
-    'payments.create', 'payments.read',
-    'restaurant.view', 'restaurant.manage_tables', 'restaurant.manage_orders', 'restaurant.kot',
-    'settings.business_type', 'settings.restaurant', 'settings.modules'
-  ],
-  staff: [
-    'dashboard.view', 'products.read', 'customers.read', 'invoices.create', 'invoices.read'
-  ]
+const calculateInvoiceTotals = (items = []) => {
+  const lines = items.map(calculateInvoiceItemTotals)
+  const subtotal = roundCurrency(lines.reduce((sum, line) => sum + line.baseAmount, 0))
+  const discount = roundCurrency(lines.reduce((sum, line) => sum + line.discountAmount, 0))
+  const gst = roundCurrency(lines.reduce((sum, line) => sum + line.gstAmount, 0))
+  const total = roundCurrency(lines.reduce((sum, line) => sum + line.totalLine, 0))
+  return { subtotal, discount, gst, total, lines }
 }
-app.get('/api/health', async (_req, res) => res.json({ ok: true, database: Boolean(pool) }))
+
+const toBusiness = (business) => business && ({ id: business.id, name: business.name, ownerName: business.owner_name, email: business.email, phone: business.phone, category: business.category, businessType: business.category, businessDescription: business.business_description, isExisting: business.is_existing, yearsRunning: business.years_running, address: business.address, enabledModules: normalizeEnabledModules(business.enabled_modules || business.enabledModules || []) })
+
+const toSessionUser = (business, role = 'owner', teamMemberId = null) => ({
+  ...toBusiness(business),
+  role,
+  teamMemberId: teamMemberId ?? business?.team_member_id ?? business?.teamMemberId ?? null,
+  enabledModules: normalizeEnabledModules(business?.enabled_modules || business?.enabledModules || []),
+})
+
+async function getNewAuthContext(client, email, businessId) {
+  const result = await client.query(`
+    SELECT m.id AS membership_id, m.user_id, m.role_id, m.business_id, r.name AS role_name,
+           u.id AS user_id, u.email, u.full_name, tm.id AS team_member_id
+    FROM memberships m
+    JOIN roles r ON r.id = m.role_id
+    JOIN users u ON u.id = m.user_id
+    LEFT JOIN team_members tm ON tm.business_id = m.business_id AND tm.email = u.email
+    WHERE u.email = $1 AND m.business_id = $2 AND m.status = 'active'
+    ORDER BY m.joined_at DESC NULLS LAST
+    LIMIT 1
+  `, [email, businessId])
+  return result.rows[0] || null
+}
+
+async function hasNewAuthTables(client) {
+  const result = await client.query(`
+    SELECT to_regclass('public.users') AS users_table,
+           to_regclass('public.roles') AS roles_table,
+           to_regclass('public.memberships') AS memberships_table
+  `)
+  const row = result.rows[0] || {}
+  return Boolean(row.users_table && row.roles_table && row.memberships_table)
+}
+
+app.get('/api/health', async (_req, res) => res.json({ ok: true, database: Boolean(pool), ...getDatabaseStatus() }))
 app.post('/api/auth/signup', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Set DATABASE_URL to enable account creation' })
+
   const { businessName, ownerName, email, phone, password, category, businessDescription, isExisting, yearsRunning, address } = req.body
+  if (!businessName || !ownerName || !email || !password) {
+    return res.status(400).json({ error: 'Business name, owner name, email, and password are required' })
+  }
+
   const passwordHash = await bcrypt.hash(password, 12)
-  // Get default modules for business type
   const defaultModulesMap = {
     retail: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
     wholesaler: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "team"],
@@ -107,11 +116,57 @@ app.post('/api/auth/signup', async (req, res) => {
     await client.query('BEGIN')
     const result = await client.query('INSERT INTO businesses (name, owner_name, email, phone, password_hash, category, business_description, is_existing, years_running, address, enabled_modules) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [businessName, ownerName, email, phone, passwordHash, category, businessDescription, isExisting !== 'new', yearsRunning || null, address, JSON.stringify(defaultModules)])
     const business = result.rows[0]
-    // Create owner team member
-    await client.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5)', [business.id, ownerName, email, passwordHash, 'owner'])
+
+    let userId = null
+    let roleId = null
+    let teamMemberId = null
+    const authTableCheck = await client.query(`
+      SELECT to_regclass('public.users') AS users_table,
+             to_regclass('public.roles') AS roles_table,
+             to_regclass('public.memberships') AS memberships_table
+    `)
+    const hasNewAuthTables = authTableCheck.rows[0]?.users_table && authTableCheck.rows[0]?.roles_table && authTableCheck.rows[0]?.memberships_table
+
+    if (hasNewAuthTables) {
+      const userResult = await client.query(
+        `INSERT INTO users (email, password_hash, full_name, is_active, created_at, updated_at)
+         VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, full_name = EXCLUDED.full_name, updated_at = NOW()
+         RETURNING id`,
+        [email, passwordHash, ownerName]
+      )
+      userId = userResult.rows[0].id
+
+      const ownerRole = await client.query(
+        `INSERT INTO roles (business_id, name, description, is_system, created_at)
+         VALUES ($1, 'owner', 'Business owner', TRUE, NOW())
+         ON CONFLICT (business_id, name) DO UPDATE SET description = EXCLUDED.description
+         RETURNING id`,
+        [business.id]
+      )
+      roleId = ownerRole.rows[0].id
+
+      await client.query(
+        `INSERT INTO memberships (user_id, business_id, role_id, status, joined_at, created_at)
+         VALUES ($1, $2, $3, 'active', NOW(), NOW())
+         ON CONFLICT (user_id, business_id) DO UPDATE SET role_id = EXCLUDED.role_id, status = 'active', joined_at = NOW()
+         RETURNING id`,
+        [userId, business.id, roleId]
+      )
+    }
+
+    const tmResult = await client.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (business_id, email) DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role RETURNING id', [business.id, ownerName, email, passwordHash, 'owner'])
+    teamMemberId = tmResult.rows[0].id
+
     await client.query('COMMIT')
-    const payload = { businessId: business.id, email, role: 'owner', userType: 'team_member' }
-    res.status(201).json({ token: tokenFor(payload), user: toBusiness(business) })
+
+    const accessPayload = { userId: userId || teamMemberId, businessId: business.id, roleId: roleId || null, roleName: 'owner', permissions: getPermissionsForRole('owner') }
+    const refreshPayload = { userId: userId || teamMemberId, businessId: business.id, roleId: roleId || null, roleName: 'owner', permissions: getPermissionsForRole('owner') }
+
+    const accessToken = generateAccessToken(accessPayload)
+    const refreshToken = generateRefreshToken(refreshPayload)
+
+    res.status(201).json({ token: accessToken, refreshToken, user: toSessionUser(business, 'owner', teamMemberId) })
   } catch (error) {
     await client.query('ROLLBACK')
     throw error
@@ -122,119 +177,243 @@ app.post('/api/auth/signup', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Set DATABASE_URL to enable login' })
   const { email, password } = req.body
-  
-  // First check team_members table
-  let teamMember = await pool.query('SELECT * FROM team_members WHERE email = $1', [email])
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required' })
+
+  let teamMember = await pool.query('SELECT * FROM team_members WHERE email = $1 ORDER BY created_at DESC LIMIT 1', [email])
+  let business
+  let role = 'owner'
+  let teamMemberId = null
+  let userId = null
+  let roleId = null
+
   if (teamMember.rows.length > 0) {
     const member = teamMember.rows[0]
-    if (await bcrypt.compare(password, member.password_hash)) {
-      const business = await pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules FROM businesses WHERE id = $1', [member.business_id])
-      const payload = { businessId: member.business_id, email: member.email, role: member.role, userType: 'team_member', teamMemberId: member.id }
-      return res.json({ token: tokenFor(payload), user: toBusiness(business.rows[0]) })
+    if (!(await bcrypt.compare(password, member.password_hash))) {
+      return res.status(401).json({ error: 'Invalid email or password' })
     }
-    return res.status(401).json({ error: 'Invalid email or password' })
-  }
-  
-  // Fallback to businesses table (legacy owner login)
-  const result = await pool.query('SELECT * FROM businesses WHERE email = $1', [email])
-  const user = result.rows[0]
-  if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Invalid email or password' })
-  
-  // Check if team_member exists for this business owner
-  const existingMember = await pool.query('SELECT * FROM team_members WHERE business_id = $1 AND email = $2', [user.id, email])
-  let role = 'owner'
-  if (existingMember.rows.length > 0) {
-    role = existingMember.rows[0].role
+
+    business = await pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules FROM businesses WHERE id = $1', [member.business_id])
+    role = member.role || 'owner'
+    teamMemberId = member.id
+
+    const newMembership = await getNewAuthContext(pool, email, member.business_id)
+    if (newMembership) {
+      userId = newMembership.user_id
+      roleId = newMembership.role_id
+      role = newMembership.role_name || role
+      teamMemberId = newMembership.team_member_id || teamMemberId
+    }
   } else {
-    // Create team_member for legacy owner
-    await pool.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (business_id, email) DO NOTHING', [user.id, user.owner_name, email, user.password_hash, 'owner'])
+    const result = await pool.query('SELECT * FROM businesses WHERE email = $1', [email])
+    const user = result.rows[0]
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Invalid email or password' })
+
+    business = await pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules FROM businesses WHERE id = $1', [user.id])
+
+    const existingMember = await pool.query('SELECT * FROM team_members WHERE business_id = $1 AND email = $2 ORDER BY created_at DESC LIMIT 1', [user.id, email])
+    if (existingMember.rows.length > 0) {
+      role = existingMember.rows[0].role || 'owner'
+      teamMemberId = existingMember.rows[0].id
+    } else {
+      role = 'owner'
+      const insertResult = await pool.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (business_id, email) DO NOTHING RETURNING id', [user.id, user.owner_name, email, user.password_hash, 'owner'])
+      teamMemberId = insertResult.rows[0]?.id || null
+    }
+
+    const newMembership = await getNewAuthContext(pool, email, user.id)
+    if (newMembership) {
+      userId = newMembership.user_id
+      roleId = newMembership.role_id
+      role = newMembership.role_name || role
+      teamMemberId = newMembership.team_member_id || teamMemberId
+    }
   }
-  
-  const payload = { businessId: user.id, email: user.email, role, userType: 'business_owner' }
-  res.json({ token: tokenFor(payload), user: toBusiness(user) })
+
+  const businessRecord = business.rows[0]
+  if (!businessRecord) return res.status(401).json({ error: 'Business not found for this account' })
+
+  const resolvedUserId = userId || teamMemberId || businessRecord.id
+  const accessPayload = { userId: resolvedUserId, businessId: businessRecord.id, roleId: roleId || null, roleName: role, permissions: getPermissionsForRole(role) }
+  const refreshPayload = { userId: resolvedUserId, businessId: businessRecord.id, roleId: roleId || null, roleName: role, permissions: getPermissionsForRole(role) }
+
+  const accessToken = generateAccessToken(accessPayload)
+  const refreshToken = generateRefreshToken(refreshPayload)
+
+  res.json({ token: accessToken, refreshToken, user: toSessionUser(businessRecord, role, teamMemberId) })
+})
+app.post('/api/auth/refresh', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' })
+  const { refreshToken } = req.body
+  if (!refreshToken) return res.status(400).json({ error: 'Refresh token required' })
+
+  try {
+    const decoded = verifyRefreshToken(refreshToken)
+    if (!decoded.userId || !decoded.businessId) {
+      return res.status(401).json({ error: 'Invalid refresh token' })
+    }
+
+    let membershipResult = await pool.query(`
+      SELECT m.id AS membership_id, m.user_id, m.role_id, m.business_id, r.name AS role_name,
+             u.id AS user_id, u.email, tm.id AS team_member_id
+      FROM memberships m
+      JOIN roles r ON r.id = m.role_id
+      JOIN users u ON u.id = m.user_id
+      LEFT JOIN team_members tm ON tm.business_id = m.business_id AND tm.email = u.email
+      WHERE m.user_id = $1 AND m.business_id = $2 AND m.status = 'active'
+      LIMIT 1
+    `, [decoded.userId, decoded.businessId])
+
+    if (membershipResult.rows.length === 0) {
+      membershipResult = await pool.query(`
+        SELECT tm.id as membership_id, tm.id as team_member_id, tm.business_id, tm.email, tm.role as role_name, tm.id as user_id
+        FROM team_members tm
+        WHERE tm.id = $1 AND tm.business_id = $2
+      `, [decoded.userId, decoded.businessId])
+    }
+
+    if (membershipResult.rows.length === 0) {
+      return res.status(401).json({ error: 'Membership not found or inactive' })
+    }
+
+    const membership = membershipResult.rows[0]
+    const resolvedUserId = membership.user_id || decoded.userId
+    const roleName = membership.role_name || decoded.roleName || 'owner'
+    const permissions = getPermissionsForRole(roleName)
+    const newAccessPayload = { userId: resolvedUserId, businessId: decoded.businessId, roleId: membership.role_id || null, roleName, permissions }
+    const newRefreshPayload = { userId: resolvedUserId, businessId: decoded.businessId, roleId: membership.role_id || null, roleName, permissions }
+
+    const newAccessToken = generateAccessToken(newAccessPayload)
+    const newRefreshToken = generateRefreshToken(newRefreshPayload)
+
+    res.json({ token: newAccessToken, refreshToken: newRefreshToken })
+  } catch (e) {
+    if (e.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Refresh token expired', code: 'REFRESH_EXPIRED' })
+    }
+    return res.status(401).json({ error: 'Invalid refresh token' })
+  }
 })
 app.get('/api/dashboard', auth, requirePermission('dashboard.view'), async (req, res) => {
   if (!pool) return res.json({ business: null, salesToday: 0, customers: 0, lowStock: 0, outstandingUdhar: 0 })
-  const businessId = req.user.businessId
+  const businessId = req.businessId
   const [business, sales, customers, lowStock, udhar, teamMember] = await Promise.all([
     pool.query('SELECT id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules FROM businesses WHERE id=$1', [businessId]),
     pool.query('SELECT COALESCE(SUM(total),0) AS value FROM invoices WHERE business_id=$1 AND created_at::date=CURRENT_DATE', [businessId]),
     pool.query('SELECT COUNT(*) AS value FROM customers WHERE business_id=$1', [businessId]),
     pool.query('SELECT COUNT(*) AS value FROM products WHERE business_id=$1 AND current_stock <= low_stock_threshold', [businessId]),
     pool.query('SELECT COALESCE(SUM(balance),0) AS value FROM customers WHERE business_id=$1', [businessId]),
-    pool.query('SELECT role FROM team_members WHERE business_id=$1 AND email=$2', [businessId, req.user.email])
+    pool.query('SELECT id, role FROM team_members WHERE business_id=$1 AND email=$2 ORDER BY created_at DESC LIMIT 1', [businessId, req.email])
   ])
-  const role = teamMember.rows[0]?.role || req.user.role || 'owner'
-  res.json({ business: toBusiness(business.rows[0]), salesToday: sales.rows[0].value, customers: customers.rows[0].value, lowStock: lowStock.rows[0].value, outstandingUdhar: udhar.rows[0].value, role })
+  const role = req.roleName || teamMember.rows[0]?.role || 'owner'
+  const teamMemberId = req.membershipId || teamMember.rows[0]?.id || req.userId
+  const businessRow = business.rows[0]
+  res.json({ business: toSessionUser(businessRow, role, teamMemberId), salesToday: sales.rows[0].value, customers: customers.rows[0].value, lowStock: lowStock.rows[0].value, outstandingUdhar: udhar.rows[0].value, role, teamMemberId })
 })
 app.get('/api/products', auth, requirePermission('products.read'), async (req, res) => {
-  const result = await pool.query('SELECT id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold FROM products WHERE business_id=$1 ORDER BY name', [req.user.businessId])
+  const result = await pool.query('SELECT id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold FROM products WHERE business_id=$1 ORDER BY name', [req.businessId])
   res.json(result.rows)
 })
 app.post('/api/products', auth, requirePermission('products.create'), async (req, res) => {
   const { name, sku, category, purchasePrice = 0, sellingPrice = 0, currentStock = 0, unit = 'piece', lowStockThreshold = 5 } = req.body
   if (!name) return res.status(400).json({ error: 'Product name is required' })
-  const result = await pool.query('INSERT INTO products (business_id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.user.businessId, name, sku, category, purchasePrice, sellingPrice, currentStock, unit, lowStockThreshold])
+  const result = await pool.query('INSERT INTO products (business_id, name, sku, category, purchase_price, selling_price, current_stock, unit, low_stock_threshold) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [req.businessId, name, sku, category, purchasePrice, sellingPrice, currentStock, unit, lowStockThreshold])
   res.status(201).json(result.rows[0])
 })
 app.delete('/api/products/:id', auth, requirePermission('products.delete'), async (req, res) => {
-  const result = await pool.query('DELETE FROM products WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.businessId])
+  const result = await pool.query('DELETE FROM products WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Product not found' })
   res.status(204).end()
 })
 app.get('/api/customers', auth, requirePermission('customers.read'), async (req, res) => {
-  const result = await pool.query('SELECT id, name, phone, email, address, balance FROM customers WHERE business_id=$1 ORDER BY name', [req.user.businessId])
+  const result = await pool.query('SELECT id, name, phone, email, address, balance FROM customers WHERE business_id=$1 ORDER BY name', [req.businessId])
   res.json(result.rows)
 })
 app.post('/api/customers', auth, requirePermission('customers.create'), async (req, res) => {
   const { name, phone, email, address } = req.body
   if (!name) return res.status(400).json({ error: 'Customer name is required' })
-  const result = await pool.query('INSERT INTO customers (business_id, name, phone, email, address) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.businessId, name, phone, email, address])
+  const result = await pool.query('INSERT INTO customers (business_id, name, phone, email, address) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.businessId, name, phone, email, address])
   res.status(201).json(result.rows[0])
 })
 app.delete('/api/customers/:id', auth, requirePermission('customers.delete'), async (req, res) => {
-  const result = await pool.query('DELETE FROM customers WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.businessId])
+  const result = await pool.query('DELETE FROM customers WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Customer not found' })
   res.status(204).end()
 })
 app.post('/api/invoices', auth, requirePermission('invoices.create'), async (req, res) => {
   const { customerId, items = [], total, paid = 0, status } = req.body
-  if (!items.length || !total) return res.status(400).json({ error: 'Invoice items and total are required' })
+  const safeItems = Array.isArray(items) ? items : []
+
+  if (!safeItems.length) {
+    return res.status(400).json({ error: 'Invoice items are required' })
+  }
+
+  const computed = calculateInvoiceTotals(safeItems)
+  const normalizedTotal = roundCurrency(total ?? computed.total)
+  const normalizedPaid = roundCurrency(paid)
+
+  if (Math.abs(normalizedTotal - computed.total) > 0.01) {
+    return res.status(400).json({ error: 'Invoice total does not match the itemized calculation', expectedTotal: computed.total, receivedTotal: normalizedTotal })
+  }
+
+  if (normalizedPaid < 0 || normalizedPaid > normalizedTotal + 0.01) {
+    return res.status(400).json({ error: 'Paid amount must be between 0 and the invoice total' })
+  }
+
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    const customer = customerId ? await client.query('SELECT id FROM customers WHERE id=$1 AND business_id=$2', [customerId, req.user.businessId]) : { rows: [{ id: null }] }
-    if (!customer.rows.length) throw Object.assign(new Error('Customer does not belong to this business'), { status: 403 })
-    for (const item of items) {
-      const product = await client.query('SELECT id, current_stock FROM products WHERE id=$1 AND business_id=$2 FOR UPDATE', [item.productId, req.user.businessId])
-      if (!product.rows.length) throw Object.assign(new Error('Product does not belong to this business'), { status: 403 })
-      if (Number(product.rows[0].current_stock) < Number(item.quantity)) throw Object.assign(new Error(`Insufficient stock for product ${item.productId}`), { status: 400 })
+    const customer = customerId ? await client.query('SELECT id FROM customers WHERE id=$1 AND business_id=$2', [customerId, req.businessId]) : { rows: [{ id: null }] }
+    if (customerId && !customer.rows.length) {
+      throw Object.assign(new Error('Customer does not belong to this business'), { status: 403 })
     }
-    // Check if Udhar module is enabled for this business
-    const businessResult = await client.query('SELECT enabled_modules FROM businesses WHERE id=$1', [req.user.businessId])
+
+    for (const item of safeItems) {
+      const product = await client.query('SELECT id, current_stock FROM products WHERE id=$1 AND business_id=$2 FOR UPDATE', [item.productId, req.businessId])
+      if (!product.rows.length) {
+        throw Object.assign(new Error('Product does not belong to this business'), { status: 403 })
+      }
+      const line = calculateInvoiceItemTotals(item)
+      if (Number(product.rows[0].current_stock) < line.quantity) {
+        throw Object.assign(new Error(`Insufficient stock for product ${item.productId}`), { status: 400 })
+      }
+    }
+
+    const businessResult = await client.query('SELECT enabled_modules FROM businesses WHERE id=$1', [req.businessId])
     const enabledModules = businessResult.rows[0]?.enabled_modules || []
     const hasUdhar = Array.isArray(enabledModules) && enabledModules.includes('udhar')
-    const defaultStatus = !status ? (Number(paid) >= total ? 'paid' : Number(paid) > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid')) : status
-    const invoice = await client.query('INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user.businessId, customerId || null, total, paid, defaultStatus])
-    for (const item of items) {
-      await client.query('INSERT INTO invoice_items (invoice_id, product_id, quantity, price, gst_percent, discount_percent, discount_amount) VALUES ($1,$2,$3,$4,$5,$6,$7)', [invoice.rows[0].id, item.productId, item.quantity, item.price, item.gstPercent || 0, item.discountPercent || 0, item.discountAmount || 0])
-      await client.query('UPDATE products SET current_stock=current_stock-$1 WHERE id=$2 AND business_id=$3', [item.quantity, item.productId, req.user.businessId])
+    const defaultStatus = status || (normalizedPaid >= normalizedTotal ? 'paid' : normalizedPaid > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid'))
+    const invoice = await client.query('INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.businessId, customerId || null, normalizedTotal, normalizedPaid, defaultStatus])
+
+    for (const item of safeItems) {
+      const line = calculateInvoiceItemTotals(item)
+      await client.query(
+        'INSERT INTO invoice_items (invoice_id, product_id, quantity, price, gst_percent, discount_percent, discount_amount) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [invoice.rows[0].id, item.productId, line.quantity, line.unitPrice, line.gstPercent, line.discountPercent, line.discountAmount]
+      )
+      await client.query('UPDATE products SET current_stock=current_stock-$1 WHERE id=$2 AND business_id=$3', [line.quantity, item.productId, req.businessId])
     }
-    const due = Math.max(Number(total) - Number(paid), 0)
+
+    const due = Math.max(roundCurrency(normalizedTotal - normalizedPaid), 0)
     if (customerId && due > 0) {
-      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.businessId])
+      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.businessId])
       await client.query("INSERT INTO udhar_ledger (customer_id, invoice_id, type, amount, note) VALUES ($1,$2,'credit',$3,'Invoice credit')", [customerId, invoice.rows[0].id, due])
     }
+
     await client.query('COMMIT')
-    res.status(201).json(invoice.rows[0])
-  } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+    res.status(201).json({ ...invoice.rows[0], totals: computed, status: defaultStatus })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
 })
 app.get('/api/invoices', auth, requirePermission('invoices.read'), async (req, res) => {
-  const result = await pool.query('SELECT i.id, i.total, i.paid, i.status, i.created_at, c.name AS customer_name, c.phone AS customer_phone FROM invoices i LEFT JOIN customers c ON c.id=i.customer_id WHERE i.business_id=$1 ORDER BY i.created_at DESC', [req.user.businessId])
+  const result = await pool.query('SELECT i.id, i.total, i.paid, i.status, i.created_at, c.name AS customer_name, c.phone AS customer_phone FROM invoices i LEFT JOIN customers c ON c.id=i.customer_id WHERE i.business_id=$1 ORDER BY i.created_at DESC', [req.businessId])
   res.json(result.rows)
 })
 app.get('/api/expenses', auth, requirePermission('expenses.read'), async (req, res) => {
-  const result = await pool.query('SELECT * FROM expenses WHERE business_id=$1 ORDER BY expense_date DESC', [req.user.businessId])
+  const result = await pool.query('SELECT * FROM expenses WHERE business_id=$1 ORDER BY expense_date DESC', [req.businessId])
   res.json(result.rows)
 })
 app.post('/api/expenses', auth, requirePermission('expenses.create'), async (req, res) => {
@@ -242,19 +421,19 @@ app.post('/api/expenses', auth, requirePermission('expenses.create'), async (req
   if (!category || !amount || !expense_date) return res.status(400).json({ error: 'Category, amount, and date are required' })
   const result = await pool.query(
     'INSERT INTO expenses (business_id, branch_id, category, amount, note, expense_date) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [req.user.businessId, branch_id || null, category, amount, note, expense_date]
+    [req.businessId, branch_id || null, category, amount, note, expense_date]
   )
   res.status(201).json(result.rows[0])
 })
 app.delete('/api/expenses/:id', auth, requirePermission('expenses.delete'), async (req, res) => {
-  const result = await pool.query('DELETE FROM expenses WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.user.businessId])
+  const result = await pool.query('DELETE FROM expenses WHERE id=$1 AND business_id=$2 RETURNING id', [req.params.id, req.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Expense not found' })
   res.status(204).end()
 })
 
 app.get('/api/analytics', auth, requirePermission('analytics.view'), async (req, res) => {
   if (!pool) return res.json({ sales: {}, expenses: {}, profit: {}, topProducts: [], outstanding: {} })
-  const businessId = req.user.businessId
+  const businessId = req.businessId
   const { period = 'month', startDate, endDate } = req.query
 
   let dateFilter = ''
@@ -369,7 +548,7 @@ app.get('/api/analytics', auth, requirePermission('analytics.view'), async (req,
 
 app.get('/api/restaurant/settings', auth, requirePermission('restaurant.view'), async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
-  const result = await pool.query('SELECT total_tables FROM restaurant_settings WHERE business_id=$1', [req.user.businessId])
+  const result = await pool.query('SELECT total_tables FROM restaurant_settings WHERE business_id=$1', [req.businessId])
   res.json({ totalTables: result.rows[0]?.total_tables || 0 })
 })
 
@@ -379,7 +558,7 @@ app.post('/api/restaurant/settings', auth, requirePermission('settings.restauran
   if (typeof totalTables !== 'number' || totalTables < 0 || totalTables > 100) {
     return res.status(400).json({ error: 'Total tables must be a number between 0 and 100' })
   }
-  const businessId = req.user.businessId
+  const businessId = req.businessId
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -421,7 +600,7 @@ app.get('/api/restaurant/tables', auth, requirePermission('restaurant.view'), as
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
   const result = await pool.query(
     'SELECT id, table_number, status, customer_name, expected_time FROM restaurant_tables WHERE business_id=$1 ORDER BY table_number',
-    [req.user.businessId]
+    [req.businessId]
   )
   res.json(result.rows)
 })
@@ -434,7 +613,7 @@ app.patch('/api/restaurant/tables/:id', auth, requirePermission('restaurant.mana
   }
   const result = await pool.query(
     'UPDATE restaurant_tables SET status=$1, customer_name=$2, expected_time=$3, updated_at=NOW() WHERE id=$4 AND business_id=$5 RETURNING *',
-    [status, customerName || null, expectedTime || null, req.params.id, req.user.businessId]
+    [status, customerName || null, expectedTime || null, req.params.id, req.businessId]
   )
   if (!result.rows.length) return res.status(404).json({ error: 'Table not found' })
   res.json(result.rows[0])
@@ -446,19 +625,19 @@ app.get('/api/restaurant/tables/:tableId/order', auth, requirePermission('restau
   const tableId = req.params.tableId
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   
   // Get or create open order
   let orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   
   if (!orderResult.rows.length) {
     orderResult = await pool.query(
       'INSERT INTO table_orders (business_id, table_id, status, total_amount) VALUES ($1,$2,\'open\',0) RETURNING *',
-      [req.user.businessId, tableId]
+      [req.businessId, tableId]
     )
   }
   
@@ -486,19 +665,19 @@ app.post('/api/restaurant/tables/:tableId/order/items', auth, requirePermission(
   if (!items || !items.length) return res.status(400).json({ error: 'Items required' })
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   
   // Get or create open order
   let orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   
   if (!orderResult.rows.length) {
     orderResult = await pool.query(
       'INSERT INTO table_orders (business_id, table_id, status, total_amount) VALUES ($1,$2,\'open\',0) RETURNING *',
-      [req.user.businessId, tableId]
+      [req.businessId, tableId]
     )
   }
   
@@ -517,7 +696,7 @@ app.post('/api/restaurant/tables/:tableId/order/items', auth, requirePermission(
       // Verify product belongs to business and get price
       const productResult = await client.query(
         'SELECT id, selling_price FROM products WHERE id=$1 AND business_id=$2',
-        [productId, req.user.businessId]
+        [productId, req.businessId]
       )
       if (!productResult.rows.length) throw Object.assign(new Error('Product not found'), { status: 404 })
       
@@ -568,7 +747,7 @@ app.get('/api/restaurant/tables/:tableId/kot', auth, requirePermission('restaura
   // Verify table belongs to business
   const tableResult = await pool.query(
     'SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   if (!tableResult.rows.length) return res.status(404).json({ error: 'Table not found' })
   
@@ -577,7 +756,7 @@ app.get('/api/restaurant/tables/:tableId/kot', auth, requirePermission('restaura
   // Get the latest order for this table
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -595,7 +774,7 @@ app.get('/api/restaurant/tables/:tableId/kot', auth, requirePermission('restaura
   )
   
   // Get business name
-  const businessResult = await pool.query('SELECT name FROM businesses WHERE id=$1', [req.user.businessId])
+  const businessResult = await pool.query('SELECT name FROM businesses WHERE id=$1', [req.businessId])
   
   res.json({
     tableNumber: table.table_number,
@@ -614,13 +793,13 @@ app.post('/api/restaurant/tables/:tableId/order/send-to-kitchen', auth, requireP
   const tableId = req.params.tableId
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
+  const tableCheck = await pool.query('SELECT id FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   
   // Get the latest order
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -647,14 +826,14 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, requirePer
   const { customerId, paid = 0 } = req.body
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
+  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   const table = tableCheck.rows[0]
   
   // Get the latest order
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -678,44 +857,43 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, requirePer
   try {
     await client.query('BEGIN')
     
-    const total = Number(order.total_amount)
-    const paymentAmount = Number(paid) || 0
+    const computedOrderTotal = roundCurrency(itemsResult.rows.reduce((sum, item) => sum + (Number(item.quantity) * Number(item.price)), 0))
+    if (Math.abs(Number(order.total_amount) - computedOrderTotal) > 0.01) {
+      await client.query('UPDATE table_orders SET total_amount=$1, updated_at=NOW() WHERE id=$2', [computedOrderTotal, order.id])
+    }
+
+    const total = computedOrderTotal
+    const paymentAmount = roundCurrency(paid)
     const due = Math.max(total - paymentAmount, 0)
-    // Check if Udhar module is enabled for this business
-    const businessResult = await client.query('SELECT enabled_modules FROM businesses WHERE id=$1', [req.user.businessId])
+    const businessResult = await client.query('SELECT enabled_modules FROM businesses WHERE id=$1', [req.businessId])
     const enabledModules = businessResult.rows[0]?.enabled_modules || []
     const hasUdhar = Array.isArray(enabledModules) && enabledModules.includes('udhar')
     const status = paymentAmount >= total ? 'paid' : paymentAmount > 0 ? 'partial' : (hasUdhar ? 'udhar' : 'unpaid')
     
-    // Create invoice
     const invoiceResult = await client.query(
       'INSERT INTO invoices (business_id, customer_id, total, paid, status) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [req.user.businessId, customerId || null, total, paymentAmount, status]
+      [req.businessId, customerId || null, total, paymentAmount, status]
     )
     const invoice = invoiceResult.rows[0]
     
-    // Add invoice items with GST (default 5% for restaurant food)
     for (const item of itemsResult.rows) {
-      const gstPercent = 5 // Default GST for restaurant food items
+      const gstPercent = 5
       await client.query(
         'INSERT INTO invoice_items (invoice_id, product_id, quantity, price, gst_percent, discount_percent, discount_amount) VALUES ($1,$2,$3,$4,$5,$6,$7)',
         [invoice.id, item.product_id, item.quantity, item.price, gstPercent, 0, 0]
       )
     }
     
-    // Update customer balance if there's due amount
     if (customerId && due > 0) {
-      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.user.businessId])
+      await client.query('UPDATE customers SET balance=balance+$1 WHERE id=$2 AND business_id=$3', [due, customerId, req.businessId])
       await client.query("INSERT INTO udhar_ledger (customer_id, invoice_id, type, amount, note) VALUES ($1,$2,'credit',$3,'Invoice credit')", [customerId, invoice.id, due])
     }
     
-    // Mark table order as closed
     await client.query(
       'UPDATE table_orders SET status=\'closed\', updated_at=NOW() WHERE id=$1',
       [order.id]
     )
     
-    // Free up the table
     await client.query(
       'UPDATE restaurant_tables SET status=\'vacant\', customer_name=NULL, expected_time=NULL, updated_at=NOW() WHERE id=$1',
       [tableId]
@@ -724,7 +902,7 @@ app.post('/api/restaurant/tables/:tableId/order/generate-bill', auth, requirePer
     await client.query('COMMIT')
     
     res.status(201).json({ 
-      invoice, 
+      invoice: { ...invoice, total, paid: paymentAmount }, 
       tableNumber: table.table_number,
       message: 'Bill generated successfully'
     })
@@ -742,14 +920,14 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, requirePermi
   const tableId = req.params.tableId
   
   // Verify table belongs to business
-  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.user.businessId])
+  const tableCheck = await pool.query('SELECT id, table_number FROM restaurant_tables WHERE id=$1 AND business_id=$2', [tableId, req.businessId])
   if (!tableCheck.rows.length) return res.status(404).json({ error: 'Table not found' })
   const table = tableCheck.rows[0]
   
   // Get the latest order
   const orderResult = await pool.query(
     'SELECT * FROM table_orders WHERE table_id=$1 AND business_id=$2 AND status IN (\'open\', \'sent_to_kitchen\') ORDER BY created_at DESC LIMIT 1',
-    [tableId, req.user.businessId]
+    [tableId, req.businessId]
   )
   
   if (!orderResult.rows.length) return res.status(404).json({ error: 'No active order for this table' })
@@ -786,7 +964,7 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, requirePermi
   const grandTotal = subtotal + totalGst
 
   // Get business name
-  const businessResult = await pool.query('SELECT name, address FROM businesses WHERE id=$1', [req.user.businessId])
+  const businessResult = await pool.query('SELECT name, address FROM businesses WHERE id=$1', [req.businessId])
 
   res.json({
     tableNumber: table.table_number,
@@ -805,7 +983,7 @@ app.get('/api/restaurant/tables/:tableId/order/bill-preview', auth, requirePermi
 app.post('/api/payments', auth, requirePermission('payments.create'), async (req, res) => {
   const { customerId, amount, note = 'Payment received' } = req.body
   if (!customerId || !amount || Number(amount) <= 0) return res.status(400).json({ error: 'Customer and positive payment amount are required' })
-  const result = await pool.query('UPDATE customers SET balance=GREATEST(balance-$1,0) WHERE id=$2 AND business_id=$3 RETURNING *', [amount, customerId, req.user.businessId])
+  const result = await pool.query('UPDATE customers SET balance=GREATEST(balance-$1,0) WHERE id=$2 AND business_id=$3 RETURNING *', [amount, customerId, req.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Customer not found' })
   await pool.query("INSERT INTO udhar_ledger (customer_id, type, amount, note) VALUES ($1,'payment',$2,$3)", [customerId, amount, note])
   res.status(201).json(result.rows[0])
@@ -823,7 +1001,7 @@ app.post('/api/invoices/:id/pdf', auth, requirePermission('invoices.export'), as
      JOIN businesses b ON b.id = i.business_id
      LEFT JOIN customers c ON c.id = i.customer_id
      WHERE i.id = $1 AND i.business_id = $2`,
-    [invoiceId, req.user.businessId]
+    [invoiceId, req.businessId]
   )
   
   if (!invoiceResult.rows.length) return res.status(404).json({ error: 'Invoice not found' })
@@ -983,7 +1161,7 @@ doc.end()
 
 // Team API endpoints
 app.get('/api/team', auth, requirePermission('settings.team'), async (req, res) => {
-  const result = await pool.query('SELECT id, name, email, role, created_at FROM team_members WHERE business_id = $1 ORDER BY created_at', [req.user.businessId])
+  const result = await pool.query('SELECT id, name, email, role, created_at FROM team_members WHERE business_id = $1 ORDER BY created_at', [req.businessId])
   res.json(result.rows)
 })
 
@@ -996,35 +1174,89 @@ app.post('/api/team/invite', auth, requirePermission('users.invite'), async (req
   if (!validRoles.includes(role)) {
     return res.status(400).json({ error: 'Invalid role' })
   }
-  // Only owner can create other owners
-  if (role === 'owner' && req.user.role !== 'owner') {
+  if (role === 'owner' && req.roleName !== 'owner') {
     return res.status(403).json({ error: 'Only owners can create other owners' })
   }
-  const existing = await pool.query('SELECT id FROM team_members WHERE business_id = $1 AND email = $2', [req.user.businessId, email])
+
+  const existing = await pool.query('SELECT id FROM team_members WHERE business_id = $1 AND email = $2', [req.businessId, email])
   if (existing.rows.length > 0) {
     return res.status(400).json({ error: 'Team member with this email already exists' })
   }
+
   const passwordHash = await bcrypt.hash(password, 12)
-  const result = await pool.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role, created_at', [req.user.businessId, name, email, passwordHash, role])
-  res.status(201).json(result.rows[0])
+  const client = await pool.connect()
+
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role, created_at', [req.businessId, name, email, passwordHash, role])
+
+    if (await hasNewAuthTables(client)) {
+      const normalizedRole = role === 'owner' ? 'owner' : role === 'manager' ? 'manager' : 'staff'
+      const userResult = await client.query(
+        `INSERT INTO users (email, password_hash, full_name, is_active, created_at, updated_at)
+         VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+         ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, full_name = EXCLUDED.full_name, updated_at = NOW()
+         RETURNING id`,
+        [email, passwordHash, name]
+      )
+        
+      const roleResult = await client.query(
+        `INSERT INTO roles (business_id, name, description, is_system, created_at)
+         VALUES ($1, $2, 'Business role', TRUE, NOW())
+         ON CONFLICT (business_id, name) DO UPDATE SET description = EXCLUDED.description
+         RETURNING id`,
+        [req.businessId, normalizedRole]
+      )
+
+      await client.query(
+        `INSERT INTO memberships (user_id, business_id, role_id, status, joined_at, created_at)
+         VALUES ($1, $2, $3, 'active', NOW(), NOW())
+         ON CONFLICT (user_id, business_id) DO UPDATE SET role_id = EXCLUDED.role_id, status = 'active', joined_at = NOW()`,
+        [userResult.rows[0].id, req.businessId, roleResult.rows[0].id]
+      )
+    }
+
+    await client.query('COMMIT')
+    res.status(201).json(result.rows[0])
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
 })
 
 app.delete('/api/team/:id', auth, requirePermission('users.remove'), async (req, res) => {
   const memberId = req.params.id
-  // Prevent self-removal
-  if (req.user.teamMemberId && Number(memberId) === req.user.teamMemberId) {
+  if (req.membershipId && Number(memberId) === req.membershipId) {
     return res.status(400).json({ error: 'Cannot remove yourself' })
   }
-  const member = await pool.query('SELECT role FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.user.businessId])
+  const member = await pool.query('SELECT role, email FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.businessId])
   if (!member.rows.length) {
     return res.status(404).json({ error: 'Team member not found' })
   }
-  // Only owner can remove other owners
-  if (member.rows[0].role === 'owner' && req.user.role !== 'owner') {
+  if (member.rows[0].role === 'owner' && req.roleName !== 'owner') {
     return res.status(403).json({ error: 'Only owners can remove other owners' })
   }
-  await pool.query('DELETE FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.user.businessId])
-  res.status(204).end()
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('DELETE FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.businessId])
+    if (await hasNewAuthTables(client)) {
+      const userRow = await client.query('SELECT id FROM users WHERE email = $1 LIMIT 1', [member.rows[0].email])
+      if (userRow.rows[0]) {
+        await client.query('DELETE FROM memberships WHERE user_id = $1 AND business_id = $2', [userRow.rows[0].id, req.businessId])
+      }
+    }
+    await client.query('COMMIT')
+    res.status(204).end()
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
 })
 
 app.patch('/api/team/:id/role', auth, requirePermission('users.manage_roles'), async (req, res) => {
@@ -1034,20 +1266,43 @@ app.patch('/api/team/:id/role', auth, requirePermission('users.manage_roles'), a
   if (!validRoles.includes(role)) {
     return res.status(400).json({ error: 'Invalid role' })
   }
-  // Only owner can assign owner role
-  if (role === 'owner' && req.user.role !== 'owner') {
+  if (role === 'owner' && req.roleName !== 'owner') {
     return res.status(403).json({ error: 'Only owners can assign owner role' })
   }
-  const member = await pool.query('SELECT role FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.user.businessId])
+  const member = await pool.query('SELECT role, email FROM team_members WHERE id = $1 AND business_id = $2', [memberId, req.businessId])
   if (!member.rows.length) {
     return res.status(404).json({ error: 'Team member not found' })
   }
-  // Only owner can change another owner's role
-  if (member.rows[0].role === 'owner' && req.user.role !== 'owner') {
+  if (member.rows[0].role === 'owner' && req.roleName !== 'owner') {
     return res.status(403).json({ error: 'Only owners can change owner role' })
   }
-  const result = await pool.query('UPDATE team_members SET role = $1 WHERE id = $2 AND business_id = $3 RETURNING id, name, email, role, created_at', [role, memberId, req.user.businessId])
-  res.json(result.rows[0])
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('UPDATE team_members SET role = $1 WHERE id = $2 AND business_id = $3 RETURNING id, name, email, role, created_at', [role, memberId, req.businessId])
+
+    if (await hasNewAuthTables(client)) {
+      const userRow = await client.query('SELECT id FROM users WHERE email = $1 LIMIT 1', [member.rows[0].email])
+      if (userRow.rows[0]) {
+        const roleRow = await client.query('SELECT id FROM roles WHERE business_id = $1 AND name = $2 LIMIT 1', [req.businessId, role])
+        if (roleRow.rows[0]) {
+          await client.query(
+            `UPDATE memberships SET role_id = $1, status = 'active', joined_at = COALESCE(joined_at, NOW()) WHERE user_id = $2 AND business_id = $3`,
+            [roleRow.rows[0].id, userRow.rows[0].id, req.businessId]
+          )
+        }
+      }
+    }
+
+    await client.query('COMMIT')
+    res.json(result.rows[0])
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
 })
 
 app.post('/api/business/update-type', auth, requirePermission('settings.business_type'), async (req, res) => {
@@ -1067,7 +1322,7 @@ app.post('/api/business/update-type', auth, requirePermission('settings.business
     other: ["dashboard", "products", "customers", "udhar", "invoices", "expenses", "analytics", "reports", "tables", "menu", "kot", "team"]
   }
   const defaultModules = defaultModulesMap[category] || defaultModulesMap.other
-  const result = await pool.query('UPDATE businesses SET category=$1, enabled_modules=$2 WHERE id=$3 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [category, JSON.stringify(defaultModules), req.user.businessId])
+  const result = await pool.query('UPDATE businesses SET category=$1, enabled_modules=$2 WHERE id=$3 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [category, JSON.stringify(defaultModules), req.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Business not found' })
   const user = result.rows[0]
   res.json({ user: toBusiness(user) })
@@ -1079,7 +1334,7 @@ app.post('/api/business/update-modules', auth, requirePermission('settings.modul
   if (!Array.isArray(enabledModules)) {
     return res.status(400).json({ error: 'enabledModules must be an array' })
   }
-  const result = await pool.query('UPDATE businesses SET enabled_modules=$1 WHERE id=$2 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [JSON.stringify(enabledModules), req.user.businessId])
+  const result = await pool.query('UPDATE businesses SET enabled_modules=$1 WHERE id=$2 RETURNING id, name, owner_name, email, phone, category, business_description, is_existing, years_running, address, enabled_modules', [JSON.stringify(enabledModules), req.businessId])
   if (!result.rows.length) return res.status(404).json({ error: 'Business not found' })
   const user = result.rows[0]
   res.json({ user: toBusiness(user) })
