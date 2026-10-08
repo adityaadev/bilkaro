@@ -91,3 +91,23 @@ CREATE TABLE table_order_items (
   sent_to_kitchen BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE auth_token_families (
+  id UUID PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  business_id TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_auth_token_families_expires_at ON auth_token_families(expires_at);
+
+CREATE TABLE revoked_tokens (
+  token_hash TEXT PRIMARY KEY,
+  token_type TEXT NOT NULL CHECK (token_type IN ('access', 'refresh')),
+  family_id UUID,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
+CREATE INDEX idx_revoked_tokens_family_id ON revoked_tokens(family_id);

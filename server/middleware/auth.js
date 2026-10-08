@@ -1,10 +1,27 @@
 import jwt from 'jsonwebtoken';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { pool } from '../db.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'bilkaro-local-secret';
+const configuredJwtSecret = process.env.JWT_SECRET?.trim();
 const JWT_ACCESS_EXPIRY = process.env.JWT_ACCESS_EXPIRY || '15m';
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'bilkaro-refresh-secret';
+const configuredRefreshSecret = process.env.JWT_REFRESH_SECRET?.trim();
 const JWT_REFRESH_EXPIRY = process.env.JWT_REFRESH_EXPIRY || '7d';
+const supportedNodeEnvironments = new Set(['development', 'test', 'production']);
+
+if (!supportedNodeEnvironments.has(process.env.NODE_ENV)) {
+  throw new Error('NODE_ENV must be explicitly set to development, test, or production.');
+}
+
+if (process.env.NODE_ENV === 'production' && (!configuredJwtSecret || !configuredRefreshSecret)) {
+  throw new Error('JWT_SECRET and JWT_REFRESH_SECRET must be configured in production.');
+}
+
+if (process.env.NODE_ENV === 'production' && configuredJwtSecret === configuredRefreshSecret) {
+  throw new Error('JWT_SECRET and JWT_REFRESH_SECRET must be different in production.');
+}
+
+const JWT_SECRET = configuredJwtSecret || randomBytes(32).toString('hex');
+const JWT_REFRESH_SECRET = configuredRefreshSecret || randomBytes(32).toString('hex');
 
 // Permission cache for performance
 const permissionCache = new Map();
@@ -31,19 +48,34 @@ function clearPermissionCache(roleId) {
 }
 
 function generateAccessToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_ACCESS_EXPIRY });
+  return jwt.sign({ ...payload, tokenUse: 'access', jti: randomUUID() }, JWT_SECRET, { expiresIn: JWT_ACCESS_EXPIRY });
 }
 
 function generateRefreshToken(payload) {
-  return jwt.sign(payload, JWT_REFRESH_SECRET, { expiresIn: JWT_REFRESH_EXPIRY });
+  return jwt.sign({ ...payload, tokenUse: 'refresh', jti: randomUUID() }, JWT_REFRESH_SECRET, { expiresIn: JWT_REFRESH_EXPIRY });
 }
 
-function verifyAccessToken(token) {
-  return jwt.verify(token, JWT_SECRET);
+export function generateTokenPair(payload, familyId = randomUUID()) {
+  const familyPayload = { ...payload, sid: familyId };
+  const token = generateAccessToken(familyPayload);
+  const refreshToken = generateRefreshToken(familyPayload);
+  return { token, refreshToken, familyId, refreshExpiresAt: jwt.decode(refreshToken).exp };
+}
+
+function verifyAccessToken(token, options = {}) {
+  return jwt.verify(token, JWT_SECRET, options);
 }
 
 function verifyRefreshToken(token) {
   return jwt.verify(token, JWT_REFRESH_SECRET);
+}
+
+export function hashToken(token) {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+export function verifyLogoutAccessToken(token) {
+  return verifyAccessToken(token, { ignoreExpiration: true });
 }
 
 export function getPermissionsForRole(roleName, fallback = []) {
@@ -64,7 +96,29 @@ export async function auth(req, res, next) {
   try {
     // Try new token format first
     const decoded = verifyAccessToken(token);
-    console.log('[Auth] Decoded token:', JSON.stringify(decoded));
+    if (decoded.tokenUse && decoded.tokenUse !== 'access') {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
+    const revoked = await pool.query(
+      'SELECT 1 FROM revoked_tokens WHERE token_hash = $1 AND expires_at > NOW()',
+      [hashToken(token)]
+    );
+    if (revoked.rows.length) {
+      return res.status(401).json({ error: 'Token revoked' });
+    }
+    if (decoded.sid) {
+      const family = await pool.query(
+        `SELECT 1 FROM auth_token_families
+         WHERE id = $1 AND user_id = $2 AND business_id = $3
+           AND revoked_at IS NULL AND expires_at > NOW()`,
+        [decoded.sid, String(decoded.userId), String(decoded.businessId)]
+      );
+      if (!family.rows.length) {
+        return res.status(401).json({ error: 'Session revoked or expired' });
+      }
+    }
+    req.token = token;
+    req.tokenExpiresAt = decoded.exp;
     
     // New format (full): { userId, businessId, roleId, permissions? }
     if (decoded.userId && decoded.businessId && decoded.roleId) {

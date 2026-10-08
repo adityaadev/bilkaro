@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
 
+const developmentEnv = {
+  ...process.env,
+  NODE_ENV: process.env.NODE_ENV || "development",
+};
+
 const services = [
-  spawn(process.execPath, ["server/index.js"], { stdio: "inherit" }),
-  spawn(process.execPath, ["node_modules/vite/bin/vite.js"], { stdio: "inherit" }),
+  spawn(process.execPath, ["server/index.js"], { stdio: "inherit", env: developmentEnv }),
+  spawn(process.execPath, ["node_modules/vite/bin/vite.js"], { stdio: "inherit", env: developmentEnv }),
 ];
 
 let stopping = false;

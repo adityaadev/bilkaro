@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:client": "vite",
-    "dev:server": "node server/index.js",
+    "dev:server": "node scripts/dev-server.mjs",
     "server": "node server/index.js",
     "start": "node server/index.js",
     "build": "vite build",

@@ -34,17 +34,52 @@ import "./App.css";
 import "./mobile.css";
 import "./desktop.css";
 import ExpensesView from "./ExpensesView";
+import { commitIfCurrent, createAuthSessionGuard } from "./authSession";
 
 const API_BASE = "/api";
 export const api = axios.create({ baseURL: API_BASE });
+const authSessionGuard = createAuthSessionGuard();
+function logApiError(label, error) {
+  console.error(label, {
+    url: error.config?.url?.split("?")[0],
+    method: error.config?.method,
+    status: error.response?.status,
+    code: error.code,
+  });
+}
+
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("bilkaro_token");
-  if (token && !config.url?.startsWith("/auth/"))
+  const publicAuthEndpoints = ["/auth/signup", "/auth/login", "/auth/refresh"];
+  if (token && !publicAuthEndpoints.includes(config.url))
     config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
+
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+function invalidateAuthSession() {
+  authSessionGuard.invalidate();
+  delete api.defaults.headers.common.Authorization;
+  processQueue(new Error("Authentication session changed"));
+}
+
 function clearAuthAndRedirect() {
+  invalidateAuthSession();
   localStorage.removeItem("bilkaro_token");
+  localStorage.removeItem("bilkaro_refresh_token");
   localStorage.removeItem("bilkaro_user");
   localStorage.removeItem("bilkaro_enabled_modules");
   window.location.href = "/";
@@ -52,15 +87,69 @@ function clearAuthAndRedirect() {
 
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
-    console.error("[Bilkaro API error]", {
-      url: error.config?.url,
-      method: error.config?.method,
-      status: error.response?.status,
-      response: error.response?.data,
-      error,
-    });
-    if (error.response?.status === 401 && !error.config?.url?.startsWith("/auth/")) {
+  async (error) => {
+    const originalRequest = error.config;
+    logApiError("[Bilkaro API error]", error);
+
+    // Handle token expiry - try to refresh
+    if (
+      error.response?.status === 401 &&
+      error.response?.data?.code === 'TOKEN_EXPIRED' &&
+      !originalRequest?.url?.startsWith("/auth/") &&
+      !originalRequest._retry
+    ) {
+      const refreshGeneration = authSessionGuard.capture();
+      if (isRefreshing) {
+        // Wait for the refresh to complete
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then((token) => {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            return api(originalRequest);
+          })
+          .catch((err) => {
+            return Promise.reject(err);
+          });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      const refreshToken = localStorage.getItem("bilkaro_refresh_token");
+      if (refreshToken) {
+        try {
+          const response = await api.post("/auth/refresh", { refreshToken });
+          const { token: newAccessToken, refreshToken: newRefreshToken } = response.data;
+          const committed = commitIfCurrent(authSessionGuard, refreshGeneration, () => {
+            localStorage.setItem("bilkaro_token", newAccessToken);
+            if (newRefreshToken) {
+              localStorage.setItem("bilkaro_refresh_token", newRefreshToken);
+            }
+
+            api.defaults.headers.common['Authorization'] = `Bearer ${newAccessToken}`;
+            originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+          });
+          if (!committed) {
+            throw new Error("Authentication session changed during refresh");
+          }
+          
+          processQueue(null, newAccessToken);
+          return api(originalRequest);
+        } catch (refreshError) {
+          processQueue(refreshError, null);
+          if (authSessionGuard.isCurrent(refreshGeneration)) {
+            clearAuthAndRedirect();
+          }
+          return Promise.reject(refreshError);
+        } finally {
+          isRefreshing = false;
+        }
+      }
+    }
+
+    // For other 401s or if no refresh token, clear auth and redirect
+    if (error.response?.status === 401 && !originalRequest?.url?.startsWith("/auth/")) {
       clearAuthAndRedirect();
     }
     return Promise.reject(error);
@@ -198,13 +287,7 @@ function App() {
     window.setTimeout(() => setToast(""), 3500);
   };
   const reportError = (action, error) => {
-    console.error(`[Bilkaro ${action}]`, {
-      url: error.config?.url,
-      method: error.config?.method,
-      status: error.response?.status,
-      response: error.response?.data,
-      error,
-    });
+    logApiError(`[Bilkaro ${action}]`, error);
     notify(`${action} failed: ${errorText(error)}`);
   };
   const loadData = async () => {
@@ -224,20 +307,18 @@ function App() {
       if (requestId !== loadRequest.current) return;
       setDashboard(dashboardResponse.data);
       const business = dashboardResponse.data.business;
-      setUser({
+      const activeBusiness = {
         ...business,
-        ownerName:
-          business.name ||
-          business.ownerName,
+        ownerName: business.name || business.ownerName,
         role: business.role || 'owner',
-      });
-      localStorage.setItem(
-        "bilkaro_user",
-        JSON.stringify(business),
-      );
-      if (business.enabledModules) {
-        setEnabledModules(business.enabledModules);
-        localStorage.setItem("bilkaro_enabled_modules", JSON.stringify(business.enabledModules));
+        teamMemberId: business.teamMemberId || user?.teamMemberId || null,
+        enabledModules: Array.isArray(business.enabledModules) ? business.enabledModules : Array.isArray(user?.enabledModules) ? user.enabledModules : [],
+      };
+      setUser(activeBusiness);
+      localStorage.setItem("bilkaro_user", JSON.stringify(activeBusiness));
+      if (activeBusiness.enabledModules?.length) {
+        setEnabledModules(activeBusiness.enabledModules);
+        localStorage.setItem("bilkaro_enabled_modules", JSON.stringify(activeBusiness.enabledModules));
       }
       setProducts(productsResponse.data);
       setCustomers(customersResponse.data);
@@ -280,12 +361,27 @@ function App() {
         );
     };
   }, [token, active]);
-  const saveSession = ({ token: nextToken, user: nextUser }) => {
+  const saveSession = ({ token: nextToken, user: nextUser, refreshToken }) => {
+    invalidateAuthSession();
+    const normalizedUser = {
+      ...nextUser,
+      role: nextUser?.role || 'owner',
+      teamMemberId: nextUser?.teamMemberId ?? nextUser?.id ?? null,
+      enabledModules: Array.isArray(nextUser?.enabledModules) ? nextUser.enabledModules : [],
+    };
     localStorage.removeItem("bilkaro_token");
+    localStorage.removeItem("bilkaro_refresh_token");
     localStorage.removeItem("bilkaro_user");
     localStorage.setItem("bilkaro_token", nextToken);
-    localStorage.setItem("bilkaro_user", JSON.stringify(nextUser));
-    setUser(nextUser);
+    if (refreshToken) {
+      localStorage.setItem("bilkaro_refresh_token", refreshToken);
+    }
+    localStorage.setItem("bilkaro_user", JSON.stringify(normalizedUser));
+    setUser(normalizedUser);
+    if (normalizedUser.enabledModules?.length) {
+      setEnabledModules(normalizedUser.enabledModules);
+      localStorage.setItem("bilkaro_enabled_modules", JSON.stringify(normalizedUser.enabledModules));
+    }
     setDashboard(null);
     setProducts([]);
     setCustomers([]);
@@ -293,8 +389,16 @@ function App() {
     setExpenses([]);
     setToken(nextToken);
   };
-  const logout = () => {
+  const logout = async () => {
+    invalidateAuthSession();
+    const refreshToken = localStorage.getItem("bilkaro_refresh_token");
+    try {
+      await api.post("/auth/logout", refreshToken ? { refreshToken } : {});
+    } catch (error) {
+      reportError("Logout", error);
+    }
     localStorage.removeItem("bilkaro_token");
+    localStorage.removeItem("bilkaro_refresh_token");
     localStorage.removeItem("bilkaro_user");
     localStorage.removeItem("bilkaro_enabled_modules");
     setToken(null);
@@ -2757,7 +2861,7 @@ function ProductModal({ onClose, onSaved, onError }) {
       onClose();
       await onSaved();
     } catch (error) {
-      console.error("[Bilkaro Add product]", error);
+      logApiError("[Bilkaro Add product]", error);
       onError("Add product", error);
     }
   };
@@ -2838,7 +2942,7 @@ function CustomerModal({ onClose, onSaved, onError }) {
       onClose();
       await onSaved();
     } catch (error) {
-      console.error("[Bilkaro Add customer]", error);
+      logApiError("[Bilkaro Add customer]", error);
       onError("Add customer", error);
     }
   };
@@ -3002,7 +3106,7 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
       notify("Invoice created successfully!")
       await onSaved()
     } catch (error) {
-      console.error("[Bilkaro Create invoice]", error)
+      logApiError("[Bilkaro Create invoice]", error)
       onError("Create invoice", error)
     }
   }
@@ -3021,7 +3125,7 @@ function InvoiceModal({ products, customers, onClose, onSaved, onError, user, no
       link.remove()
       window.URL.revokeObjectURL(url)
     } catch (error) {
-      console.error("[Bilkaro PDF generation]", error)
+      logApiError("[Bilkaro PDF generation]", error)
       onError("Generate PDF", error)
     } finally {
       setGeneratingPdf(false)
@@ -3286,7 +3390,7 @@ function PaymentModal({ customers, onClose, onSaved, onError }) {
       onClose();
       await onSaved();
     } catch (error) {
-      console.error("[Bilkaro Record payment]", error);
+      logApiError("[Bilkaro Record payment]", error);
       onError("Record payment", error);
     }
   };
@@ -3367,12 +3471,7 @@ function AuthScreen({ mode, setMode, onAuthenticated }) {
       );
       onAuthenticated(data);
     } catch (requestError) {
-      console.error("[Bilkaro auth]", {
-        url: requestError.config?.url,
-        status: requestError.response?.status,
-        response: requestError.response?.data,
-        error: requestError,
-      });
+      logApiError("[Bilkaro auth]", requestError);
       setError(errorText(requestError));
     }
   };

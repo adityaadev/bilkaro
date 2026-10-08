@@ -1,7 +1,8 @@
 import express from 'express'
 import cors from 'cors'
 import bcrypt from 'bcryptjs'
-import { auth, requirePermission, requireRole, requireBusinessOwnership, generateAccessToken, generateRefreshToken, verifyRefreshToken, getPermissionsForRole } from './middleware/auth.js'
+import { randomUUID } from 'node:crypto'
+import { auth, requirePermission, requireRole, requireBusinessOwnership, generateTokenPair, verifyRefreshToken, verifyLogoutAccessToken, getPermissionsForRole, hashToken } from './middleware/auth.js'
 import { pool, getDatabaseStatus } from './db.js'
 
 const app = express()
@@ -92,6 +93,17 @@ async function hasNewAuthTables(client) {
   return Boolean(row.users_table && row.roles_table && row.memberships_table)
 }
 
+async function createSessionTokens(queryable, payload, familyId = randomUUID()) {
+  const tokens = generateTokenPair(payload, familyId)
+  await queryable.query(
+    `INSERT INTO auth_token_families (id, user_id, business_id, expires_at)
+     VALUES ($1, $2, $3, to_timestamp($4))
+     ON CONFLICT (id) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+    [tokens.familyId, String(payload.userId), String(payload.businessId), tokens.refreshExpiresAt]
+  )
+  return tokens
+}
+
 app.get('/api/health', async (_req, res) => res.json({ ok: true, database: Boolean(pool), ...getDatabaseStatus() }))
 app.post('/api/auth/signup', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Set DATABASE_URL to enable account creation' })
@@ -158,15 +170,11 @@ app.post('/api/auth/signup', async (req, res) => {
     const tmResult = await client.query('INSERT INTO team_members (business_id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (business_id, email) DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role RETURNING id', [business.id, ownerName, email, passwordHash, 'owner'])
     teamMemberId = tmResult.rows[0].id
 
+    const accessPayload = { userId: userId || teamMemberId, businessId: business.id, roleId: roleId || null, roleName: 'owner', permissions: getPermissionsForRole('owner') }
+    const tokens = await createSessionTokens(client, accessPayload)
     await client.query('COMMIT')
 
-    const accessPayload = { userId: userId || teamMemberId, businessId: business.id, roleId: roleId || null, roleName: 'owner', permissions: getPermissionsForRole('owner') }
-    const refreshPayload = { userId: userId || teamMemberId, businessId: business.id, roleId: roleId || null, roleName: 'owner', permissions: getPermissionsForRole('owner') }
-
-    const accessToken = generateAccessToken(accessPayload)
-    const refreshToken = generateRefreshToken(refreshPayload)
-
-    res.status(201).json({ token: accessToken, refreshToken, user: toSessionUser(business, 'owner', teamMemberId) })
+    res.status(201).json({ token: tokens.token, refreshToken: tokens.refreshToken, user: toSessionUser(business, 'owner', teamMemberId) })
   } catch (error) {
     await client.query('ROLLBACK')
     throw error
@@ -234,12 +242,9 @@ app.post('/api/auth/login', async (req, res) => {
 
   const resolvedUserId = userId || teamMemberId || businessRecord.id
   const accessPayload = { userId: resolvedUserId, businessId: businessRecord.id, roleId: roleId || null, roleName: role, permissions: getPermissionsForRole(role) }
-  const refreshPayload = { userId: resolvedUserId, businessId: businessRecord.id, roleId: roleId || null, roleName: role, permissions: getPermissionsForRole(role) }
+  const tokens = await createSessionTokens(pool, accessPayload)
 
-  const accessToken = generateAccessToken(accessPayload)
-  const refreshToken = generateRefreshToken(refreshPayload)
-
-  res.json({ token: accessToken, refreshToken, user: toSessionUser(businessRecord, role, teamMemberId) })
+  res.json({ token: tokens.token, refreshToken: tokens.refreshToken, user: toSessionUser(businessRecord, role, teamMemberId) })
 })
 app.post('/api/auth/refresh', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database not configured' })
@@ -250,6 +255,9 @@ app.post('/api/auth/refresh', async (req, res) => {
     const decoded = verifyRefreshToken(refreshToken)
     if (!decoded.userId || !decoded.businessId) {
       return res.status(401).json({ error: 'Invalid refresh token' })
+    }
+    if (decoded.tokenUse && decoded.tokenUse !== 'refresh') {
+      return res.status(401).json({ error: 'Invalid token type' })
     }
 
     let membershipResult = await pool.query(`
@@ -280,17 +288,182 @@ app.post('/api/auth/refresh', async (req, res) => {
     const roleName = membership.role_name || decoded.roleName || 'owner'
     const permissions = getPermissionsForRole(roleName)
     const newAccessPayload = { userId: resolvedUserId, businessId: decoded.businessId, roleId: membership.role_id || null, roleName, permissions }
-    const newRefreshPayload = { userId: resolvedUserId, businessId: decoded.businessId, roleId: membership.role_id || null, roleName, permissions }
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [hashToken(refreshToken)]
+      )
+      const familyId = decoded.sid || randomUUID()
 
-    const newAccessToken = generateAccessToken(newAccessPayload)
-    const newRefreshToken = generateRefreshToken(newRefreshPayload)
+      if (decoded.sid) {
+        const family = await client.query(
+          `SELECT id, user_id, business_id, revoked_at, expires_at
+           FROM auth_token_families WHERE id = $1 FOR UPDATE`,
+          [decoded.sid]
+        )
+        const row = family.rows[0]
+        if (
+          !row || String(row.user_id) !== String(decoded.userId) ||
+          String(row.business_id) !== String(decoded.businessId) ||
+          row.revoked_at || new Date(row.expires_at) <= new Date()
+        ) {
+          await client.query('ROLLBACK')
+          return res.status(401).json({ error: 'Refresh token family revoked or expired' })
+        }
+      }
 
-    res.json({ token: newAccessToken, refreshToken: newRefreshToken })
+      const revokedToken = await client.query(
+        `INSERT INTO revoked_tokens (token_hash, token_type, family_id, expires_at)
+         VALUES ($1, 'refresh', $2, to_timestamp($3))
+         ON CONFLICT (token_hash) DO NOTHING
+         RETURNING token_hash`,
+        [hashToken(refreshToken), familyId, decoded.exp]
+      )
+      if (!revokedToken.rows.length) {
+        const consumed = await client.query(
+          'SELECT family_id FROM revoked_tokens WHERE token_hash = $1 FOR UPDATE',
+          [hashToken(refreshToken)]
+        )
+        const replayFamilyId = consumed.rows[0]?.family_id || decoded.sid
+        if (replayFamilyId) {
+          await client.query(
+            'UPDATE auth_token_families SET revoked_at = COALESCE(revoked_at, NOW()) WHERE id = $1',
+            [replayFamilyId]
+          )
+        }
+        await client.query('COMMIT')
+        return res.status(401).json({ error: 'Refresh token revoked or already used' })
+      }
+
+      const tokens = await createSessionTokens(client, newAccessPayload, familyId)
+      await client.query('COMMIT')
+      res.json({ token: tokens.token, refreshToken: tokens.refreshToken })
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
   } catch (e) {
     if (e.name === 'TokenExpiredError') {
       return res.status(401).json({ error: 'Refresh token expired', code: 'REFRESH_EXPIRED' })
     }
+    if (e.code) {
+      console.error('[Auth] Refresh persistence failed:', e.code)
+      return res.status(503).json({ error: 'Authentication service unavailable' })
+    }
     return res.status(401).json({ error: 'Invalid refresh token' })
+  }
+})
+
+app.post('/api/auth/logout', async (req, res) => {
+  const { refreshToken } = req.body
+  if (!refreshToken) return res.status(400).json({ error: 'Refresh token required' })
+
+  let refreshClaims
+  try {
+    refreshClaims = verifyRefreshToken(refreshToken)
+  } catch {
+    return res.status(401).json({ error: 'Invalid refresh token' })
+  }
+  if (!refreshClaims.userId || !refreshClaims.businessId || !refreshClaims.exp || refreshClaims.tokenUse && refreshClaims.tokenUse !== 'refresh') {
+    return res.status(401).json({ error: 'Invalid refresh token' })
+  }
+
+  const authorization = req.headers.authorization
+  const accessToken = authorization?.startsWith('Bearer ') ? authorization.slice(7) : null
+  let accessClaims = null
+  if (accessToken) {
+    try {
+      const claims = verifyLogoutAccessToken(accessToken)
+      const sameSession = String(claims.userId) === String(refreshClaims.userId) &&
+        String(claims.businessId) === String(refreshClaims.businessId) &&
+        (!refreshClaims.sid || claims.sid === refreshClaims.sid)
+      if (sameSession && (!claims.tokenUse || claims.tokenUse === 'access')) accessClaims = claims
+    } catch {
+      accessClaims = null
+    }
+  }
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [hashToken(refreshToken)]
+    )
+    let familyId = refreshClaims.sid || null
+
+    if (familyId) {
+      const family = await client.query(
+        `SELECT id, user_id, business_id, revoked_at, expires_at
+         FROM auth_token_families WHERE id = $1 FOR UPDATE`,
+        [familyId]
+      )
+      const row = family.rows[0]
+      if (
+        !row || String(row.user_id) !== String(refreshClaims.userId) ||
+        String(row.business_id) !== String(refreshClaims.businessId) ||
+        row.revoked_at || new Date(row.expires_at) <= new Date()
+      ) {
+        await client.query('ROLLBACK')
+        return res.status(401).json({ error: 'Refresh token family revoked or expired' })
+      }
+      await client.query(
+        'UPDATE auth_token_families SET revoked_at = NOW() WHERE id = $1',
+        [familyId]
+      )
+    } else {
+      const membership = await client.query(
+        `SELECT 1 FROM memberships
+         WHERE user_id = $1 AND business_id = $2 AND status = 'active'
+         UNION ALL
+         SELECT 1 FROM team_members WHERE id = $1 AND business_id = $2
+         LIMIT 1`,
+        [refreshClaims.userId, refreshClaims.businessId]
+      )
+      if (!membership.rows.length) {
+        await client.query('ROLLBACK')
+        return res.status(401).json({ error: 'Refresh token membership not found' })
+      }
+
+      const priorToken = await client.query(
+        'SELECT family_id FROM revoked_tokens WHERE token_hash = $1 FOR UPDATE',
+        [hashToken(refreshToken)]
+      )
+      familyId = priorToken.rows[0]?.family_id || null
+      if (familyId) {
+        await client.query(
+          `UPDATE auth_token_families SET revoked_at = COALESCE(revoked_at, NOW())
+           WHERE id = $1 AND user_id = $2 AND business_id = $3`,
+          [familyId, String(refreshClaims.userId), String(refreshClaims.businessId)]
+        )
+      }
+    }
+
+    await client.query(
+      `INSERT INTO revoked_tokens (token_hash, token_type, family_id, expires_at)
+       VALUES ($1, 'refresh', $2, to_timestamp($3))
+       ON CONFLICT (token_hash) DO NOTHING`,
+      [hashToken(refreshToken), familyId, refreshClaims.exp]
+    )
+    if (accessToken && accessClaims) {
+      await client.query(
+        `INSERT INTO revoked_tokens (token_hash, token_type, family_id, expires_at)
+         VALUES ($1, 'access', $2, to_timestamp($3))
+         ON CONFLICT (token_hash) DO NOTHING`,
+        [hashToken(accessToken), accessClaims.sid || familyId, accessClaims.exp]
+      )
+    }
+    await client.query('COMMIT')
+    res.json({ success: true })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
   }
 })
 app.get('/api/dashboard', auth, requirePermission('dashboard.view'), async (req, res) => {
